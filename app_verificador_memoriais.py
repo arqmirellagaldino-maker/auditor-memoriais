@@ -13,7 +13,7 @@ from pypdf.generic import DictionaryObject, NameObject, TextStringObject, ArrayO
 from docx.enum.text import WD_COLOR_INDEX
 
 # ==============================================================================
-# QUALITY HUB | MEMORIAIS — V3
+# MIA | MEMORIAIS — V4
 # ------------------------------------------------------------------------------
 # PRINCÍPIOS
 # 1) O PADRÃO DE ACABAMENTOS R96 é a fonte técnica principal.
@@ -378,95 +378,168 @@ def extrair_texto_docx(file_bytes):
 # MOTOR DE CONFERÊNCIA R96
 # ==============================================================================
 
-def avaliar_regra(trecho, regra):
-    esperado = regra["especificacao"]
-    ne = normalizar(esperado)
-    nt = normalizar(trecho)
+# ==============================================================================
+# MOTOR DE PAREAMENTO HIERÁRQUICO — V4
+# ==============================================================================
 
-    if normalizar(esperado) in {"nao aplicavel", "não aplicável"}:
-        # Sem contexto suficiente, não marcamos vermelho por ausência.
-        if not trecho:
-            return STATUS_OK, "Item previsto como não aplicável na base.", 1.0
-        # se o trecho contém um material concreto, pede validação humana
-        mats = materiais_presentes(trecho)
-        if mats:
-            return STATUS_ATENCAO, "A base indica 'Não aplicável', mas foi encontrada uma descrição no contexto. Validar aplicabilidade.", 0.4
-        return STATUS_OK, "Não foram encontrados indícios de especificação conflitante.", 0.85
+ITEM_EQUIVALENCIAS = {
+    "piso": ["piso", "pisos"],
+    "parede": ["parede", "paredes", "revestimento de parede"],
+    "teto": ["teto", "forro", "revestimento de teto"],
+    "rodape": ["rodape", "rodapé"],
+    "bancada": ["bancada", "bancadas"],
+    "louca": ["louca", "louças", "louca sanitaria", "louças sanitárias"],
+    "metais": ["metal", "metais", "torneira", "misturador", "registro"],
+    "porta": ["porta", "portas"],
+    "janela": ["janela", "janelas"],
+    "peitoril": ["peitoril", "peitoris"],
+    "soleira": ["soleira", "soleiras"],
+    "guarda corpo": ["guarda corpo", "guarda-corpo"],
+    "portao": ["portao", "portão", "portoes", "portões"],
+    "ponto de luz": ["ponto de luz", "pontos de luz", "iluminacao", "iluminação"],
+    "interruptor": ["interruptor", "interruptores"],
+    "tomada": ["tomada", "tomadas", "ponto de forca", "ponto de força"],
+    "agua fria": ["agua fria", "água fria"],
+    "agua quente": ["agua quente", "água quente"],
+    "esgoto": ["esgoto", "ponto de esgoto"],
+    "gas": ["gas", "gás", "ponto de gas", "ponto de gás"],
+}
 
+
+def aliases_item(item):
+    n = normalizar(item)
+    aliases = [n]
+    for chave, vals in ITEM_EQUIVALENCIAS.items():
+        if chave in n or n in chave:
+            aliases.extend(normalizar(v) for v in vals)
+    # O primeiro núcleo nominal costuma ser suficiente para títulos de linhas da matriz.
+    for chave, vals in ITEM_EQUIVALENCIAS.items():
+        if chave in n:
+            aliases.extend(normalizar(v) for v in vals)
+    return list(dict.fromkeys(a for a in aliases if len(a) >= 3))
+
+
+def localizar_ocorrencias(texto_norm, aliases):
+    out = []
+    for alias in aliases:
+        for m in re.finditer(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", texto_norm):
+            out.append((m.start(), m.end(), alias))
+    return sorted(out)
+
+
+def extrair_contexto_hierarquico(texto, ambiente, item, janela_ambiente=2600):
+    """Só devolve trecho quando AMBIENTE e ITEM são identificados no mesmo contexto.
+    Isso impede, por construção, comparar teto com janela, piso com bancada etc.
+    """
+    n = normalizar(texto)
+    ambs = localizar_ocorrencias(n, aliases_ambiente(ambiente))
+    if not ambs:
+        return "", False, False
+
+    itens = aliases_item(item)
+    for a_ini, a_fim, _ in ambs:
+        fim = min(len(n), a_ini + janela_ambiente)
+        bloco = n[a_ini:fim]
+        its = localizar_ocorrencias(bloco, itens)
+        if not its:
+            continue
+        # Item precisa aparecer depois do ambiente e dentro do bloco daquele ambiente.
+        i_ini, i_fim, _ = its[0]
+        abs_i = a_ini + i_ini
+        # Captura o campo/linha do item até o próximo separador forte, limitado para não invadir outro item.
+        trecho = n[abs_i:min(len(n), abs_i + 700)]
+        corte = re.search(r"\s(?:piso|parede|paredes|teto|forro|rodape|bancada|janela|porta|peitoril|soleira|metais?|loucas?|tomadas?|interruptores?)\s*[:\-]", trecho[35:])
+        if corte:
+            trecho = trecho[:35 + corte.start()]
+        return trecho.strip(), True, True
+    return "", True, False
+
+
+def avaliar_regra_v4(trecho, regra):
+    esp = str(regra["especificacao"]).strip()
+    nt, ne = normalizar(trecho), normalizar(esp)
     if not trecho:
-        return STATUS_ATENCAO, "Ambiente/descrição não localizado com segurança no memorial.", 0.0
+        return STATUS_INFO, "Item não localizado com vínculo seguro entre ambiente e item.", 0.0
 
-    sim = similaridade_textual(trecho, esperado)
-    mats_esp = materiais_presentes(esperado)
-    mats_txt = materiais_presentes(trecho)
+    # Não aplicável só é conforme quando o próprio memorial também o declara.
+    if "nao aplicavel" in ne:
+        if "nao aplicavel" in nt:
+            return STATUS_OK, "Memorial e R96 indicam item não aplicável.", 1.0
+        return STATUS_INFO, "A base indica condição não aplicável, mas o trecho não permite confirmar a mesma condição.", 0.3
 
-    # divergência de material é evidência mais forte que simples baixa similaridade
-    if mats_esp and mats_txt and mats_esp.isdisjoint(mats_txt):
-        return STATUS_ERRO, f"Material/solução encontrada parece divergir da base R96. Esperado: {', '.join(sorted(mats_esp))}.", sim
+    sim = similaridade_textual(nt, ne)
+    te, tt = tokens_significativos(ne), tokens_significativos(nt)
+    cobertura = len(te & tt) / max(1, len(te))
 
-    # presença de materiais/termos esperados + similaridade razoável
-    cobertura = 0.0
-    tok_esp = tokens_significativos(esperado)
-    tok_txt = tokens_significativos(trecho)
-    if tok_esp:
-        cobertura = len(tok_esp & tok_txt) / len(tok_esp)
+    # Correspondência literal ou técnica forte => conforme.
+    if ne in nt or nt in ne or cobertura >= 0.62 or sim >= 0.56:
+        return STATUS_OK, "Descrição tecnicamente compatível com a base R96.", max(sim, cobertura)
 
-    if sim >= 0.38 or cobertura >= 0.48 or (mats_esp and mats_esp.issubset(mats_txt)):
-        return STATUS_OK, "Descrição compatível com os principais termos técnicos da base R96.", max(sim, cobertura)
+    mats_e = materiais_presentes(ne)
+    mats_t = materiais_presentes(nt)
+    # Vermelho somente com conflito material explícito, no ambiente + item já ancorados.
+    if mats_e and mats_t and mats_e.isdisjoint(mats_t):
+        return STATUS_ERRO, f"Divergência material objetiva: memorial indica {', '.join(sorted(mats_t))}; R96 prevê {', '.join(sorted(mats_e))}.", max(sim, cobertura)
 
-    return STATUS_ATENCAO, "Não foi possível confirmar a aderência apenas pela leitura textual. Conferir o trecho indicado contra a especificação R96.", max(sim, cobertura)
+    # Ausência de prova de conformidade NÃO vira atenção do coordenador.
+    return STATUS_INFO, "Não foi possível concluir a comparação com segurança; não classificado como divergência.", max(sim, cobertura)
 
 
-def filtrar_regras(base, padrao, escopo):
+def filtrar_regras_v4(base, padrao, escopo):
     if escopo == "Área Comum":
         return base[base["escopo"] == "Área Comum"].copy()
     return base[(base["escopo"] == "Área Privativa") & (base["padrao"] == padrao)].copy()
 
 
-def auditar_base_r96(texto, base, padrao, escopo, grupos_mistos=None):
+def auditar_conjunto_r96(texto, base, padrao_tecnico, escopo, grupo_nome):
     resultados = []
-
-    if padrao != "Misto":
-        conjuntos = [(padrao, texto, "Empreendimento")]
-    else:
-        conjuntos = []
-        for g in grupos_mistos or []:
-            # Busca um trecho mais amplo a partir da torre/unidades; quando não encontra,
-            # mantém o texto completo, mas o resultado fica com identificação do grupo.
-            termos = [g.get("torre", ""), g.get("unidades", "")]
-            ntexto = normalizar(texto)
-            posicoes = [ntexto.find(normalizar(t)) for t in termos if normalizar(t) and ntexto.find(normalizar(t)) >= 0]
-            if posicoes:
-                p = min(posicoes)
-                trecho_grupo = ntexto[max(0, p - 500):min(len(ntexto), p + 9000)]
-            else:
-                trecho_grupo = texto
-            conjuntos.append((g["padrao"], trecho_grupo, f"{g['torre']} — {g['unidades']}"))
-
-    for padrao_tecnico, texto_grupo, grupo_nome in conjuntos:
-        regras = filtrar_regras(base, padrao_tecnico, escopo)
-        for _, regra in regras.iterrows():
-            contexto, achou_ambiente = localizar_contexto(texto_grupo, regra["ambiente"])
-            trecho = localizar_melhor_trecho(contexto, regra["item"], regra["especificacao"]) if achou_ambiente else ""
-            status, obs, confianca = avaliar_regra(trecho, regra)
-
-            resultados.append({
-                "Grupo / Aplicação": grupo_nome,
-                "Padrão aplicado": padrao_tecnico if escopo == "Área Privativa" else "Áreas Comuns R96",
-                "Área": escopo,
-                "Ambiente": regra["ambiente"],
-                "Seção": regra["secao"],
-                "Item": regra["item"],
-                "Texto encontrado": trecho if trecho else "Não localizado com segurança",
-                "Especificação prevista": regra["especificacao"],
-                "Status": status,
-                "Orientação / resposta prevista": regra["especificacao"],
-                "Observação": obs,
-                "Confiança": round(float(confianca), 2),
-                "Fonte": regra["fonte"],
-            })
-
+    regras = filtrar_regras_v4(base, padrao_tecnico, escopo)
+    for _, regra in regras.iterrows():
+        trecho, achou_amb, achou_item = extrair_contexto_hierarquico(texto, regra["ambiente"], regra["item"])
+        if not achou_amb or not achou_item:
+            # Não polui a lista com toda a matriz R96. O não-verificado fica disponível
+            # apenas quando o ambiente existe mas o item não pôde ser vinculado.
+            if achou_amb:
+                resultados.append({
+                    "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
+                    "Área": escopo, "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
+                    "Texto encontrado": "Não localizado com vínculo seguro", "Especificação prevista": regra["especificacao"],
+                    "Status": STATUS_INFO, "Orientação / resposta prevista": "Sem ação automática - revisar somente se necessário.",
+                    "Observação": "Ambiente localizado, mas o item não foi identificado com segurança.", "Confiança": 0.0,
+                    "Fonte": regra["fonte"],
+                })
+            continue
+        status, obs, conf = avaliar_regra_v4(trecho, regra)
+        orient = "Nenhuma ação necessária." if status == STATUS_OK else (regra["especificacao"] if status == STATUS_ERRO else "Sem ação automática - vínculo insuficiente.")
+        resultados.append({
+            "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
+            "Área": escopo, "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
+            "Texto encontrado": trecho, "Especificação prevista": regra["especificacao"], "Status": status,
+            "Orientação / resposta prevista": orient, "Observação": obs, "Confiança": round(float(conf), 2), "Fonte": regra["fonte"],
+        })
     return resultados
+
+
+def auditar_base_r96_v4(texto, base, padrao_predominante, excecoes=None):
+    resultados = []
+    # Sempre verifica área privativa + área comum. Escopo não é mais escolha do usuário.
+    for escopo in ["Área Privativa", "Área Comum"]:
+        resultados.extend(auditar_conjunto_r96(texto, base, padrao_predominante, escopo, "Regra geral"))
+
+    # Exceções de padrão: avalia somente um recorte identificado pela descrição fornecida.
+    nt = normalizar(texto)
+    for ex in excecoes or []:
+        aplic = ex.get("aplicacao", "").strip()
+        if not aplic:
+            continue
+        termos = [t.strip() for t in re.split(r"[-–—,:]", aplic) if len(t.strip()) >= 3]
+        pos = next((nt.find(normalizar(t)) for t in termos if normalizar(t) and nt.find(normalizar(t)) >= 0), -1)
+        if pos < 0:
+            continue
+        recorte = nt[max(0, pos-400):min(len(nt), pos+9000)]
+        resultados.extend(auditar_conjunto_r96(recorte, base, ex["padrao"], "Área Privativa", aplic))
+    return resultados
+
 
 # ==============================================================================
 # CAMADAS COMPLEMENTARES DOS PROTOCOLOS
@@ -548,287 +621,200 @@ def auditoria_protocolo_cef(texto):
     return resultados
 
 
-def auditar_memorial(texto, base, padrao, escopo, tipo_doc, grupos_mistos=None, incluir_gerais_cliente=True):
-    resultados = auditar_base_r96(texto, base, padrao, escopo, grupos_mistos)
+def auditar_memorial(texto, base, padrao, tipo_doc, excecoes=None, incluir_gerais_cliente=True):
+    resultados = auditar_base_r96_v4(texto, base, padrao, excecoes)
 
     if tipo_doc == "Memorial do Cliente (Comercial / Vendas)" and incluir_gerais_cliente:
-        resultados.extend(auditoria_especificacoes_gerais_cliente(texto, padrao, grupos_mistos))
-
+        resultados.extend(auditoria_especificacoes_gerais_cliente(texto, padrao, []))
     if tipo_doc == "Memorial CEF / Financiador":
         resultados.extend(auditoria_protocolo_cef(texto))
 
-    if not resultados:
-        return pd.DataFrame(columns=[
-            "Grupo / Aplicação", "Padrão aplicado", "Área", "Ambiente", "Seção", "Item",
+    cols = ["Grupo / Aplicação", "Padrão aplicado", "Área", "Ambiente", "Seção", "Item",
             "Texto encontrado", "Especificação prevista", "Status", "Orientação / resposta prevista",
-            "Observação", "Confiança", "Fonte"
-        ])
-    return pd.DataFrame(resultados)
+            "Observação", "Confiança", "Fonte"]
+    return pd.DataFrame(resultados, columns=cols) if resultados else pd.DataFrame(columns=cols)
 
 # ==============================================================================
 # DOCUMENTOS ANOTADOS
 # ==============================================================================
 
+def _pagina_para_ocorrencia(reader, texto_encontrado):
+    alvo = normalizar(texto_encontrado)
+    if not alvo or alvo.startswith("nao localizado") or alvo.startswith("item/gatilho"):
+        return 0
+    termos = list(tokens_significativos(alvo))[:8]
+    melhor, score = 0, 0
+    for i, page in enumerate(reader.pages):
+        pt = normalizar(page.extract_text() or "")
+        s = sum(1 for t in termos if t in pt)
+        if s > score:
+            melhor, score = i, s
+    return melhor
+
+
+def _texto_caixa(row):
+    cab = "DIVERGENCIA" if row["Status"] == STATUS_ERRO else "ATENCAO DO COORDENADOR"
+    partes = [f"MIA - {cab}", f"{row['Ambiente']} / {row['Item']}"]
+    if row["Status"] == STATUS_ERRO:
+        encontrado = str(row["Texto encontrado"])[:220]
+        previsto = str(row["Especificação prevista"])[:260]
+        partes += [f"Encontrado: {encontrado}", f"Previsto: {previsto}"]
+    else:
+        partes += [str(row["Orientação / resposta prevista"])[:430]]
+    return "\n".join(partes)
+
+
 def gerar_pdf_anotado(file_bytes, df):
+    """Mantém o PDF original e insere caixas de texto VISÍVEIS nas páginas relacionadas."""
+    from pypdf.annotations import FreeText
     reader = pypdf.PdfReader(io.BytesIO(file_bytes))
     writer = pypdf.PdfWriter()
     for page in reader.pages:
         writer.add_page(page)
 
-    pendencias = df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])]
-    if not pendencias.empty:
-        resumo = "QUALITY HUB - RESUMO DE AUDITORIA\n\n"
-        for _, row in pendencias.head(60).iterrows():
-            resumo += (
-                f"[{row['Status']}] {row['Ambiente']} - {row['Item']}\n"
-                f"Previsto: {row['Orientação / resposta prevista']}\n\n"
-            )
-        annotation = DictionaryObject({
-            NameObject('/Type'): NameObject('/Annot'),
-            NameObject('/Subtype'): NameObject('/Text'),
-            NameObject('/Rect'): ArrayObject([FloatObject(50), FloatObject(700), FloatObject(80), FloatObject(730)]),
-            NameObject('/Contents'): TextStringObject(resumo[:30000]),
-            NameObject('/Open'): BooleanObject(False),
-            NameObject('/Name'): NameObject('/Comment')
-        })
-        writer.add_annotation(page_number=0, annotation=annotation)
+    pend = df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])].copy()
+    ocupacao = {}
+    for _, row in pend.head(80).iterrows():
+        pg = _pagina_para_ocorrencia(reader, row["Texto encontrado"])
+        page = writer.pages[pg]
+        w = float(page.mediabox.width); h = float(page.mediabox.height)
+        idx = ocupacao.get(pg, 0); ocupacao[pg] = idx + 1
+        box_w = min(235, w * 0.38); box_h = 105
+        x2 = w - 18; x1 = max(18, x2 - box_w)
+        y2 = h - 24 - idx * (box_h + 8); y1 = y2 - box_h
+        if y1 < 24:
+            # Se faltar espaço, reinicia em coluna esquerda.
+            col_idx = idx - max(1, int((h-48)//(box_h+8)))
+            x1 = 18; x2 = min(w-18, 18+box_w)
+            y2 = h - 24 - col_idx * (box_h + 8); y1 = y2 - box_h
+        fill = "FDECEC" if row["Status"] == STATUS_ERRO else "FFF4CC"
+        border = "B42318" if row["Status"] == STATUS_ERRO else "9A6700"
+        annot = FreeText(
+            text=_texto_caixa(row),
+            rect=(x1, y1, x2, y2),
+            font="Helvetica",
+            font_size="8pt",
+            font_color="111111",
+            border_color=border,
+            background_color=fill,
+        )
+        writer.add_annotation(page_number=pg, annotation=annot)
 
-    output = io.BytesIO()
-    writer.write(output)
-    output.seek(0)
-    return output
+    out = io.BytesIO(); writer.write(out); out.seek(0); return out
 
 
 def gerar_docx_anotado(file_bytes, df):
     doc = docx.Document(io.BytesIO(file_bytes))
-    p = doc.add_paragraph()
-    r = p.add_run("--- QUALITY HUB | RELATÓRIO DE AUDITORIA ---")
-    r.font.bold = True
-    r.font.highlight_color = WD_COLOR_INDEX.YELLOW
-
+    p = doc.add_paragraph(); r = p.add_run("--- MIA | AUDITORIA ---"); r.font.bold = True
     pendencias = df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])]
     for _, row in pendencias.head(100).iterrows():
-        p = doc.add_paragraph()
-        r = p.add_run(
-            f"{row['Status']} [{row['Ambiente']} - {row['Item']}]\n"
-            f"Encontrado: {row['Texto encontrado']}\n"
-            f"Previsto: {row['Orientação / resposta prevista']}\n"
-        )
-        if row["Status"] == STATUS_ERRO:
-            r.font.highlight_color = WD_COLOR_INDEX.RED
-        else:
-            r.font.highlight_color = WD_COLOR_INDEX.YELLOW
-
-    output = io.BytesIO()
-    doc.save(output)
-    output.seek(0)
-    return output
+        p = doc.add_paragraph(); r = p.add_run(_texto_caixa(row))
+        r.font.highlight_color = WD_COLOR_INDEX.RED if row["Status"] == STATUS_ERRO else WD_COLOR_INDEX.YELLOW
+    output = io.BytesIO(); doc.save(output); output.seek(0); return output
 
 # ==============================================================================
 # INTERFACE
 # ==============================================================================
 
-def configurar_misto_sidebar():
-    st.sidebar.markdown("### Distribuição do empreendimento misto")
-    st.sidebar.caption("Cadastre os grupos. Ex.: Torre C | finais 01, 02, 05 e 06 | Médio")
-    qtd = st.sidebar.number_input("Quantidade de grupos", min_value=2, max_value=20, value=2, step=1)
-    grupos = []
+def configurar_excecoes_sidebar():
+    st.sidebar.markdown("### Padrões diferentes (opcional)")
+    possui = st.sidebar.checkbox("O empreendimento possui unidades com padrão diferente?", value=False)
+    if not possui:
+        return []
+    qtd = st.sidebar.number_input("Quantidade de exceções", min_value=1, max_value=12, value=1, step=1)
+    excecoes = []
     for i in range(int(qtd)):
-        with st.sidebar.expander(f"Grupo {i+1}", expanded=(i < 2)):
-            torre = st.text_input("Torre / bloco / grupo", value="Torre C" if i < 2 else "", key=f"torre_{i}")
-            unidades = st.text_input(
-                "Finais / tipologias / unidades",
-                value="01, 02, 05 e 06" if i == 0 else ("demais finais" if i == 1 else ""),
-                key=f"unidades_{i}",
-            )
-            padrao = st.selectbox("Padrão técnico", PADROES_TECNICOS, index=2 if i == 0 else 1, key=f"padrao_grupo_{i}")
-            grupos.append({"torre": torre.strip(), "unidades": unidades.strip(), "padrao": padrao})
-    return [g for g in grupos if g["torre"] and g["unidades"]]
+        with st.sidebar.expander(f"Exceção {i+1}", expanded=True):
+            aplicacao = st.text_input("Aplicação", placeholder="Ex.: Torre C - finais 01, 02, 05 e 06", key=f"aplic_{i}")
+            pad = st.selectbox("Padrão técnico", PADROES_TECNICOS, index=2, key=f"pad_ex_{i}")
+            if aplicacao.strip(): excecoes.append({"aplicacao": aplicacao.strip(), "padrao": pad})
+    return excecoes
 
 
 def main():
-    st.set_page_config(page_title="QUALITY HUB | Memoriais", page_icon="🏗️", layout="wide")
-
-    st.title("QUALITY HUB")
-    st.caption("Plataforma de Qualidade e Coordenação de Projetos | Módulo Memoriais")
+    st.set_page_config(page_title="MIA | Memoriais", page_icon="M", layout="wide")
+    st.title("MIA")
+    st.caption("Coordenação e Qualidade de Projetos | Memoriais")
 
     with st.sidebar:
         st.header("Configuração da análise")
-        tipo_doc = st.selectbox(
-            "Tipo de memorial",
-            ["Memorial do Cliente (Comercial / Vendas)", "Memorial CEF / Financiador"],
-        )
-        padrao = st.selectbox(
-            "Padrão / configuração do empreendimento",
-            ["Super Econômico", "Econômico", "Médio", "Misto"],
-            index=1,
-        )
-
-    grupos_mistos = configurar_misto_sidebar() if padrao == "Misto" else []
-
+        tipo_doc = st.selectbox("Tipo de memorial", ["Memorial do Cliente (Comercial / Vendas)", "Memorial CEF / Financiador"])
+        padrao = st.selectbox("Padrão predominante do empreendimento", PADROES_TECNICOS, index=1)
+    excecoes = configurar_excecoes_sidebar()
     with st.sidebar:
-        escopo = st.selectbox("Escopo da conferência técnica", ["Área Privativa", "Área Comum"], index=0)
         if tipo_doc.startswith("Memorial do Cliente"):
             incluir_gerais_cliente = st.checkbox("Incluir checklist de Especificações Gerais", value=True)
         else:
             incluir_gerais_cliente = False
-
         st.markdown("---")
-        st.subheader("Base técnica R96")
-        base_upload = st.file_uploader(
-            "Base de acabamentos (.xlsx) — opcional se o arquivo estiver junto do app",
-            type=["xlsx"],
-            key="base_r96",
-        )
-        st.caption(f"Arquivo esperado: {NOME_BASE_PADRAO}")
+        st.caption("Base técnica R96 carregada automaticamente pelo sistema.")
+        memorial = st.file_uploader("Memorial para análise (PDF ou DOCX)", type=["pdf", "docx"], key="memorial")
 
-        st.subheader("Memorial para análise")
-        memorial = st.file_uploader("PDF ou DOCX", type=["pdf", "docx"], key="memorial")
-
-    # resumo da configuração
-    c1, c2, c3 = st.columns(3)
+    c1,c2,c3 = st.columns(3)
     c1.metric("Tipo", "Cliente" if tipo_doc.startswith("Memorial do Cliente") else "Financiador / CEF")
-    c2.metric("Configuração", padrao)
-    c3.metric("Escopo", escopo)
-
-    if padrao == "Misto":
-        st.info("**Distribuição cadastrada:** " + descricao_config_mista(grupos_mistos))
-        if len(grupos_mistos) < 2:
-            st.warning("Cadastre pelo menos dois grupos para a configuração Misto.")
+    c2.metric("Padrão predominante", padrao)
+    c3.metric("Exceções", len(excecoes))
 
     if memorial is None:
-        st.markdown("### Fluxo desta versão")
-        st.markdown(
-            """
-            **R96 → ambiente → item → especificação prevista → trecho do memorial → resultado.**  
-            Para empreendimentos **Mistos**, o grupo cadastrado roteia a conferência para o padrão técnico correspondente.  
-            No **Memorial CEF**, as orientações da Coordenação entram como uma camada adicional de alertas de projeto/escopo.
-            """
-        )
+        st.info("Envie um memorial. A MIA verificará automaticamente Área Privativa e Área Comum contra a base R96.")
         return
 
     if st.button("Executar conferência", type="primary", use_container_width=True):
-        if padrao == "Misto" and len(grupos_mistos) < 2:
-            st.error("Configure os grupos do empreendimento misto antes de executar.")
-            return
-
-        with st.spinner("Lendo a base R96 e analisando o memorial..."):
+        with st.spinner("Analisando memorial e cruzando com a base R96..."):
             try:
-                base_bytes = base_upload.getvalue() if base_upload else None
-                base = carregar_base_r96(base_bytes)
+                base = carregar_base_r96(None)
             except Exception as e:
-                st.error(f"Não foi possível carregar a base R96: {e}")
-                return
-
-            file_bytes = memorial.getvalue()
-            ext = memorial.name.rsplit(".", 1)[-1].lower()
+                st.error(f"Não foi possível carregar a base R96 do repositório: {e}"); return
+            file_bytes = memorial.getvalue(); ext = memorial.name.rsplit(".",1)[-1].lower()
             try:
-                if ext == "pdf":
-                    partes = extrair_texto_pdf(file_bytes)
-                else:
-                    partes = extrair_texto_docx(file_bytes)
+                partes = extrair_texto_pdf(file_bytes) if ext == "pdf" else extrair_texto_docx(file_bytes)
                 texto = "\n".join(p["texto"] for p in partes)
             except Exception as e:
-                st.error(f"Erro ao ler o memorial: {e}")
-                return
-
-            if not texto.strip():
-                st.error("O memorial não contém texto pesquisável suficiente para a conferência automática.")
-                return
-
-            df = auditar_memorial(
-                texto=texto,
-                base=base,
-                padrao=padrao,
-                escopo=escopo,
-                tipo_doc=tipo_doc,
-                grupos_mistos=grupos_mistos,
-                incluir_gerais_cliente=incluir_gerais_cliente,
-            )
-            st.session_state["resultado_memorial"] = df
-            st.session_state["memorial_bytes"] = file_bytes
-            st.session_state["memorial_ext"] = ext
-            st.session_state["memorial_nome"] = memorial.name
+                st.error(f"Erro ao ler o memorial: {e}"); return
+            if not texto.strip(): st.error("O memorial não contém texto pesquisável suficiente."); return
+            df = auditar_memorial(texto, base, padrao, tipo_doc, excecoes, incluir_gerais_cliente)
+            st.session_state.update(resultado_memorial=df, memorial_bytes=file_bytes, memorial_ext=ext, memorial_nome=memorial.name)
 
     df = st.session_state.get("resultado_memorial")
-    if df is None:
-        return
+    if df is None: return
+    st.markdown("---"); st.subheader("Resultado da conferência")
+    nerr=int((df["Status"]==STATUS_ERRO).sum()); natt=int((df["Status"]==STATUS_ATENCAO).sum()); ninfo=int((df["Status"]==STATUS_INFO).sum()); nok=int((df["Status"]==STATUS_OK).sum())
+    a,b,c,d=st.columns(4); a.metric("Divergências",nerr); b.metric("Atenções",natt); c.metric("Não verificados",ninfo); d.metric("Conformes",nok)
 
-    st.markdown("---")
-    st.subheader("Resultado da conferência")
-    total = len(df)
-    n_erro = int((df["Status"] == STATUS_ERRO).sum())
-    n_at = int((df["Status"] == STATUS_ATENCAO).sum())
-    n_ok = int((df["Status"] == STATUS_OK).sum())
-    n_info = int((df["Status"] == STATUS_INFO).sum())
+    modo = st.radio("Exibir", ["Itens que exigem ação", "Não verificados", "Conformes", "Todos"], horizontal=True)
+    if modo=="Itens que exigem ação": vis=df[df["Status"].isin([STATUS_ERRO,STATUS_ATENCAO])]
+    elif modo=="Não verificados": vis=df[df["Status"]==STATUS_INFO]
+    elif modo=="Conformes": vis=df[df["Status"]==STATUS_OK]
+    else: vis=df
 
-    a, b, c, d, e = st.columns(5)
-    a.metric("Itens", total)
-    b.metric("Divergências", n_erro)
-    c.metric("Atenção", n_at)
-    d.metric("Conforme", n_ok)
-    e.metric("Sem conferência", n_info)
-
-    filtro_status = st.multiselect(
-        "Filtrar status",
-        [STATUS_ERRO, STATUS_ATENCAO, STATUS_OK, STATUS_INFO],
-        default=[STATUS_ERRO, STATUS_ATENCAO, STATUS_OK],
-    )
-    vis = df[df["Status"].isin(filtro_status)] if filtro_status else df
-
-    st.dataframe(
-        vis,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "Confiança": st.column_config.ProgressColumn("Confiança", min_value=0, max_value=1, format="%.2f"),
-            "Especificação prevista": st.column_config.TextColumn("Especificação prevista", width="large"),
-            "Texto encontrado": st.column_config.TextColumn("Texto encontrado", width="large"),
-            "Orientação / resposta prevista": st.column_config.TextColumn("Orientação / resposta prevista", width="large"),
-        },
-    )
-
-    st.caption(
-        "Importante: vermelho é reservado para divergência com evidência textual forte. "
-        "Quando o contexto é insuficiente ou a decisão depende de projeto, o sistema mantém o item em amarelo."
-    )
+    if vis.empty: st.success("Nenhum item nesta categoria.")
+    else:
+        for idx,row in vis.head(150).iterrows():
+            titulo=f"{row['Status']}  {row['Ambiente']} - {row['Item']}"
+            with st.expander(titulo, expanded=row["Status"] in [STATUS_ERRO,STATUS_ATENCAO]):
+                st.markdown(f"**Área:** {row['Área']}  |  **Padrão:** {row['Padrão aplicado']}")
+                if row["Status"]==STATUS_ERRO:
+                    st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
+                    st.markdown(f"**Previsto:** {row['Especificação prevista']}")
+                    st.markdown(f"**Orientação:** {row['Orientação / resposta prevista']}")
+                elif row["Status"]==STATUS_ATENCAO:
+                    st.markdown(f"**Confirmar:** {row['Orientação / resposta prevista']}")
+                else:
+                    st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
+                    st.markdown(f"**Previsto:** {row['Especificação prevista']}")
+                st.caption(row["Fonte"])
 
     st.markdown("### Exportações")
-    col1, col2 = st.columns(2)
-    buffer_excel = io.BytesIO()
-    with pd.ExcelWriter(buffer_excel, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Auditoria")
-        if padrao == "Misto":
-            pd.DataFrame(grupos_mistos).to_excel(writer, index=False, sheet_name="Config_Misto")
-    buffer_excel.seek(0)
-    col1.download_button(
-        "Baixar relatório XLSX",
-        data=buffer_excel,
-        file_name=f"QUALITY_HUB_Auditoria_{Path(st.session_state['memorial_nome']).stem}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        use_container_width=True,
-    )
-
-    mbytes = st.session_state["memorial_bytes"]
-    ext = st.session_state["memorial_ext"]
-    if ext == "pdf":
-        anotado = gerar_pdf_anotado(mbytes, df)
-        col2.download_button(
-            "Baixar PDF anotado",
-            data=anotado,
-            file_name=f"Anotado_{st.session_state['memorial_nome']}",
-            mime="application/pdf",
-            use_container_width=True,
-        )
+    col1,col2=st.columns(2)
+    xbio=io.BytesIO()
+    with pd.ExcelWriter(xbio, engine="openpyxl") as wr: df.to_excel(wr,index=False,sheet_name="Auditoria")
+    col1.download_button("Baixar relatório Excel", xbio.getvalue(), file_name=f"MIA_Auditoria_{Path(st.session_state['memorial_nome']).stem}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
+    if st.session_state["memorial_ext"]=="pdf":
+        anot=gerar_pdf_anotado(st.session_state["memorial_bytes"],df)
+        col2.download_button("Baixar PDF revisado com caixas de texto", anot, file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}", mime="application/pdf", use_container_width=True)
     else:
-        anotado = gerar_docx_anotado(mbytes, df)
-        col2.download_button(
-            "Baixar DOCX anotado",
-            data=anotado,
-            file_name=f"Anotado_{st.session_state['memorial_nome']}",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            use_container_width=True,
-        )
+        anot=gerar_docx_anotado(st.session_state["memorial_bytes"],df)
+        col2.download_button("Baixar DOCX revisado", anot, file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
 
 
 if __name__ == "__main__":
