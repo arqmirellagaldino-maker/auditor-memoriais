@@ -9,11 +9,12 @@ import pandas as pd
 import streamlit as st
 import pypdf
 import docx
+import fitz  # PyMuPDF: recortes visuais e PDF revisado sem sobreposição
 from pypdf.generic import DictionaryObject, NameObject, TextStringObject, ArrayObject, FloatObject, BooleanObject
 from docx.enum.text import WD_COLOR_INDEX
 
 # ==============================================================================
-# MIA | MEMORIAIS — V4
+# MIA | MEMORIAIS — V5
 # ------------------------------------------------------------------------------
 # PRINCÍPIOS
 # 1) O PADRÃO DE ACABAMENTOS R96 é a fonte técnica principal.
@@ -37,7 +38,7 @@ PADROES_TECNICOS = ["Super Econômico", "Econômico", "Médio"]
 STATUS_OK = "🟢 Conforme"
 STATUS_ERRO = "🔴 Divergência"
 STATUS_ATENCAO = "🟡 Atenção do Coordenador"
-STATUS_INFO = "⚪ Sem conferência"
+STATUS_INFO = "⚪ Não verificado"
 
 # Termos usados apenas para evitar falsos positivos em comparação textual.
 # A especificação oficial continua sendo lida diretamente do Excel R96.
@@ -374,12 +375,64 @@ def extrair_texto_docx(file_bytes):
                 saida.append({"indice": f"T{ti}-R{ri}", "texto": linha})
     return saida
 
+# ------------------------------------------------------------------------------
+# LOCALIZAÇÃO VISUAL NO PDF
+# ------------------------------------------------------------------------------
+
+def localizar_no_pdf(file_bytes, ambiente, item, trecho=""):
+    """Retorna página (1-based) e retângulo aproximado do item no PDF.
+    A busca é deliberadamente conservadora: primeiro ambiente, depois rótulo do item.
+    """
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        aliases_amb = aliases_ambiente(ambiente)
+        aliases_it = _aliases_item_rotulo(item) if '_aliases_item_rotulo' in globals() else [normalizar(item)]
+        for pno, page in enumerate(doc):
+            txt = normalizar(page.get_text("text"))
+            if not any(a in txt for a in aliases_amb):
+                continue
+            amb_rects = []
+            for a in aliases_amb:
+                amb_rects += page.search_for(a, quads=False)
+            for it in aliases_it:
+                rects = page.search_for(it, quads=False)
+                if rects:
+                    # prefere ocorrência abaixo do cabeçalho do ambiente
+                    if amb_rects:
+                        ay = min(r.y0 for r in amb_rects)
+                        abaixo = [r for r in rects if r.y0 >= ay - 4]
+                        if abaixo:
+                            r = min(abaixo, key=lambda x: x.y0)
+                            return pno + 1, (r.x0, r.y0, r.x1, r.y1)
+                    r = rects[0]
+                    return pno + 1, (r.x0, r.y0, r.x1, r.y1)
+        return None, None
+    except Exception:
+        return None, None
+
+
+def recorte_ocorrencia_pdf(file_bytes, pagina, bbox=None, zoom=1.7):
+    if not pagina:
+        return None
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        page = doc[pagina - 1]
+        if bbox:
+            r = fitz.Rect(*bbox)
+            clip = fitz.Rect(max(0, r.x0 - 55), max(0, r.y0 - 90), min(page.rect.width, r.x1 + 360), min(page.rect.height, r.y1 + 135))
+        else:
+            clip = page.rect
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+        return pix.tobytes("png")
+    except Exception:
+        return None
+
 # ==============================================================================
 # MOTOR DE CONFERÊNCIA R96
 # ==============================================================================
 
 # ==============================================================================
-# MOTOR DE PAREAMENTO HIERÁRQUICO — V4
+# MOTOR DE PAREAMENTO ESTRUTURAL — V5
 # ==============================================================================
 
 ITEM_EQUIVALENCIAS = {
@@ -419,39 +472,119 @@ def aliases_item(item):
     return list(dict.fromkeys(a for a in aliases if len(a) >= 3))
 
 
-def localizar_ocorrencias(texto_norm, aliases):
-    out = []
-    for alias in aliases:
-        for m in re.finditer(r"(?<![a-z0-9])" + re.escape(alias) + r"(?![a-z0-9])", texto_norm):
-            out.append((m.start(), m.end(), alias))
-    return sorted(out)
+def _linhas_texto(texto):
+    linhas = []
+    for i, raw in enumerate(str(texto).splitlines()):
+        limpo = re.sub(r"\s+", " ", raw).strip()
+        if limpo:
+            linhas.append({"i": i, "raw": limpo, "norm": normalizar(limpo)})
+    return linhas
 
 
-def extrair_contexto_hierarquico(texto, ambiente, item, janela_ambiente=2600):
-    """Só devolve trecho quando AMBIENTE e ITEM são identificados no mesmo contexto.
-    Isso impede, por construção, comparar teto com janela, piso com bancada etc.
+def _linha_eh_ambiente(linha_norm, ambiente):
+    # Ambiente precisa aparecer como cabeçalho/linha curta, não perdido dentro de uma descrição.
+    # Remove marcadores típicos dos memoriais comerciais (•, ▪, hífen).
+    ln = re.sub(r"^[^a-z0-9]+", "", linha_norm).strip()
+    for alias in aliases_ambiente(ambiente):
+        if ln == alias:
+            return True
+        if len(ln) <= 120 and (ln.startswith(alias + " ") or ln.startswith(alias + " -") or ln.startswith(alias + " –")):
+            return True
+    return False
+
+
+def _linha_parece_novo_ambiente(raw):
+    txt = raw.strip()
+    if txt.startswith(("•", "▪", "- ")) and len(txt) <= 140:
+        return True
+    letras = [c for c in txt if c.isalpha()]
+    if len(letras) >= 4 and len(txt) <= 95:
+        prop = sum(c.isupper() for c in letras) / len(letras)
+        if prop >= 0.82 and not re.match(r"^(PISO|PAREDE|PAREDES|TETO|FORRO|RODAP[EÉ]|BANCADA|LOU[CÇ]A|METAIS?|PORTA|JANELA|PEITORIL|SOLEIRA|EQUIPAMENTOS?)\b", txt, re.I):
+            return True
+    return False
+
+
+def _aliases_item_rotulo(item):
+    # Núcleos de item aceitos somente quando usados como RÓTULO.
+    n = normalizar(item)
+    nucleos = []
+    for chave, vals in ITEM_EQUIVALENCIAS.items():
+        if chave in n or n in chave:
+            nucleos.extend([chave] + vals)
+    # Casos compostos da planilha.
+    if "bancad" in n or "louca" in n or "tanque" in n:
+        nucleos += ["bancada", "bancadas", "louca", "loucas", "tanque", "tanques"]
+    if "parede" in n or "sanca" in n:
+        nucleos += ["parede", "paredes", "sanca", "sancas", "revestimento"]
+    if "piso" in n:
+        nucleos += ["piso", "pisos"]
+    if "rodape" in n:
+        nucleos += ["rodape", "rodapes"]
+    if "soleira" in n:
+        nucleos += ["soleira", "soleiras"]
+    if not nucleos:
+        nucleos = [n]
+    return list(dict.fromkeys(normalizar(x) for x in nucleos if len(normalizar(x)) >= 3))
+
+
+def _linha_tem_rotulo_item(linha_norm, item):
+    for alias in _aliases_item_rotulo(item):
+        # Fundamental: o nome do item deve estar no começo da linha/campo e seguido por ':' ou '-'.
+        if re.match(r"^" + re.escape(alias) + r"\s*[:\-–—]", linha_norm):
+            return True
+        # Em algumas extrações o rótulo vem sozinho na linha.
+        if linha_norm == alias:
+            return True
+    return False
+
+
+def extrair_contexto_hierarquico(texto, ambiente, item, janela_ambiente=0):
+    """Pareamento estrutural V5.
+
+    1) encontra o AMBIENTE como cabeçalho;
+    2) limita o bloco até o PRÓXIMO cabeçalho de ambiente;
+    3) encontra o ITEM somente como rótulo explícito dentro desse bloco;
+    4) captura o valor até o próximo rótulo de item.
+
+    Assim, a palavra 'bancada' dentro da descrição de PAREDE nunca vira o item Bancada.
     """
-    n = normalizar(texto)
-    ambs = localizar_ocorrencias(n, aliases_ambiente(ambiente))
-    if not ambs:
+    linhas = _linhas_texto(texto)
+    if not linhas:
         return "", False, False
 
-    itens = aliases_item(item)
-    for a_ini, a_fim, _ in ambs:
-        fim = min(len(n), a_ini + janela_ambiente)
-        bloco = n[a_ini:fim]
-        its = localizar_ocorrencias(bloco, itens)
-        if not its:
+    pos_ambientes = [k for k, ln in enumerate(linhas) if _linha_eh_ambiente(ln["norm"], ambiente)]
+    if not pos_ambientes:
+        return "", False, False
+
+    for pos in pos_ambientes:
+        fim = len(linhas)
+        for j in range(pos + 1, len(linhas)):
+            if _linha_parece_novo_ambiente(linhas[j]["raw"]):
+                fim = j
+                break
+        bloco = linhas[pos + 1:fim]
+        if not bloco:
             continue
-        # Item precisa aparecer depois do ambiente e dentro do bloco daquele ambiente.
-        i_ini, i_fim, _ = its[0]
-        abs_i = a_ini + i_ini
-        # Captura o campo/linha do item até o próximo separador forte, limitado para não invadir outro item.
-        trecho = n[abs_i:min(len(n), abs_i + 700)]
-        corte = re.search(r"\s(?:piso|parede|paredes|teto|forro|rodape|bancada|janela|porta|peitoril|soleira|metais?|loucas?|tomadas?|interruptores?)\s*[:\-]", trecho[35:])
-        if corte:
-            trecho = trecho[:35 + corte.start()]
-        return trecho.strip(), True, True
+
+        idx_item = next((j for j, ln in enumerate(bloco) if _linha_tem_rotulo_item(ln["norm"], item)), None)
+        if idx_item is None:
+            continue
+
+        capt = [bloco[idx_item]["raw"]]
+        for j in range(idx_item + 1, len(bloco)):
+            ln = bloco[j]
+            # Próximo rótulo técnico encerra o campo atual.
+            if any(_linha_tem_rotulo_item(ln["norm"], chave) for chave in ITEM_EQUIVALENCIAS):
+                break
+            if re.match(r"^(Piso|Paredes?|Teto|Forro|Rodap[eé]|Bancadas?|Lou[cç]as?|Tanque|Metais?|Portas?|Janelas?|Peitoris?|Soleiras?|Equipamentos?)\s*[:\-–—]", ln["raw"], re.I):
+                break
+            capt.append(ln["raw"])
+            if len(" ".join(capt)) > 950:
+                break
+        trecho = " ".join(capt).strip()
+        return trecho, True, True
+
     return "", True, False
 
 
@@ -477,6 +610,11 @@ def avaliar_regra_v4(trecho, regra):
 
     mats_e = materiais_presentes(ne)
     mats_t = materiais_presentes(nt)
+    # Se o memorial escolhe uma das alternativas materiais explicitamente previstas, considera conforme.
+    if mats_e and mats_t and (mats_t <= mats_e or any(m in nt and m in ne for m in sorted(mats_e, key=len, reverse=True))):
+        extras = {m for m in mats_t if m not in mats_e}
+        if not extras:
+            return STATUS_OK, "Material/solução encontrada está entre as alternativas previstas no R96.", max(sim, cobertura, 0.75)
     # Vermelho somente com conflito material explícito, no ambiente + item já ancorados.
     if mats_e and mats_t and mats_e.isdisjoint(mats_t):
         return STATUS_ERRO, f"Divergência material objetiva: memorial indica {', '.join(sorted(mats_t))}; R96 prevê {', '.join(sorted(mats_e))}.", max(sim, cobertura)
@@ -490,6 +628,33 @@ def filtrar_regras_v4(base, padrao, escopo):
         return base[base["escopo"] == "Área Comum"].copy()
     return base[(base["escopo"] == "Área Privativa") & (base["padrao"] == padrao)].copy()
 
+
+
+def recortar_texto_por_escopo(texto, escopo):
+    """Separa Área Comum e Área Privativa quando o memorial possui um divisor claro.
+    Evita, por exemplo, que SALA privativa seja pareada com SALÃO/SALA de área comum.
+    Em memoriais CEF, que repetem tabelas de área privativa/comum em várias seções,
+    mantém o texto integral para não perder blocos técnicos.
+    """
+    n = normalizar(texto)
+    marcadores_priv = ["unidades autonomas residenciais", "unidades autonomas", "apartamentos - area privativa"]
+    pos = -1
+    for m in marcadores_priv:
+        p = n.find(m)
+        if p >= 0:
+            pos = p if pos < 0 else min(pos, p)
+    if pos < 0:
+        return texto
+    # converte posição normalizada em aproximação na string original via busca sem acentos simples
+    # Para o memorial comercial, o marcador aparece literalmente em linha própria.
+    linhas = str(texto).splitlines()
+    idx = next((i for i,l in enumerate(linhas) if any(m in normalizar(l) for m in marcadores_priv)), None)
+    if idx is None:
+        return texto
+    if escopo == "Área Privativa":
+        fim = next((j for j in range(idx+1, len(linhas)) if "especificacoes gerais" in normalizar(linhas[j])), len(linhas))
+        return "\n".join(linhas[idx:fim])
+    return "\n".join(linhas[:idx])
 
 def auditar_conjunto_r96(texto, base, padrao_tecnico, escopo, grupo_nome):
     resultados = []
@@ -524,7 +689,8 @@ def auditar_base_r96_v4(texto, base, padrao_predominante, excecoes=None):
     resultados = []
     # Sempre verifica área privativa + área comum. Escopo não é mais escolha do usuário.
     for escopo in ["Área Privativa", "Área Comum"]:
-        resultados.extend(auditar_conjunto_r96(texto, base, padrao_predominante, escopo, "Regra geral"))
+        texto_escopo = recortar_texto_por_escopo(texto, escopo)
+        resultados.extend(auditar_conjunto_r96(texto_escopo, base, padrao_predominante, escopo, "Regra geral"))
 
     # Exceções de padrão: avalia somente um recorte identificado pela descrição fornecida.
     nt = normalizar(texto)
@@ -638,69 +804,64 @@ def auditar_memorial(texto, base, padrao, tipo_doc, excecoes=None, incluir_gerai
 # DOCUMENTOS ANOTADOS
 # ==============================================================================
 
-def _pagina_para_ocorrencia(reader, texto_encontrado):
-    alvo = normalizar(texto_encontrado)
-    if not alvo or alvo.startswith("nao localizado") or alvo.startswith("item/gatilho"):
-        return 0
-    termos = list(tokens_significativos(alvo))[:8]
-    melhor, score = 0, 0
-    for i, page in enumerate(reader.pages):
-        pt = normalizar(page.extract_text() or "")
-        s = sum(1 for t in termos if t in pt)
-        if s > score:
-            melhor, score = i, s
-    return melhor
-
-
 def _texto_caixa(row):
-    cab = "DIVERGENCIA" if row["Status"] == STATUS_ERRO else "ATENCAO DO COORDENADOR"
-    partes = [f"MIA - {cab}", f"{row['Ambiente']} / {row['Item']}"]
     if row["Status"] == STATUS_ERRO:
-        encontrado = str(row["Texto encontrado"])[:220]
-        previsto = str(row["Especificação prevista"])[:260]
-        partes += [f"Encontrado: {encontrado}", f"Previsto: {previsto}"]
-    else:
-        partes += [str(row["Orientação / resposta prevista"])[:430]]
-    return "\n".join(partes)
+        return (f"DIVERGÊNCIA — {row['Ambiente']} / {row['Item']}\n"
+                f"Encontrado: {str(row['Texto encontrado'])[:180]}\n"
+                f"Corrigir para: {str(row['Especificação prevista'])[:220]}")
+    return (f"ATENÇÃO — {row['Item']}\n"
+            f"Confirmar: {str(row['Orientação / resposta prevista'])[:320]}")
 
 
 def gerar_pdf_anotado(file_bytes, df):
-    """Mantém o PDF original e insere caixas de texto VISÍVEIS nas páginas relacionadas."""
-    from pypdf.annotations import FreeText
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-    writer = pypdf.PdfWriter()
-    for page in reader.pages:
-        writer.add_page(page)
+    """Cria PDF revisado com o memorial INTACTO à esquerda e faixa MIA à direita.
+    Nenhuma caixa cobre o documento original.
+    """
+    src = fitz.open(stream=file_bytes, filetype="pdf")
+    out = fitz.open()
+    painel = 250
 
-    pend = df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])].copy()
-    ocupacao = {}
-    for _, row in pend.head(80).iterrows():
-        pg = _pagina_para_ocorrencia(reader, row["Texto encontrado"])
-        page = writer.pages[pg]
-        w = float(page.mediabox.width); h = float(page.mediabox.height)
-        idx = ocupacao.get(pg, 0); ocupacao[pg] = idx + 1
-        box_w = min(235, w * 0.38); box_h = 105
-        x2 = w - 18; x1 = max(18, x2 - box_w)
-        y2 = h - 24 - idx * (box_h + 8); y1 = y2 - box_h
-        if y1 < 24:
-            # Se faltar espaço, reinicia em coluna esquerda.
-            col_idx = idx - max(1, int((h-48)//(box_h+8)))
-            x1 = 18; x2 = min(w-18, 18+box_w)
-            y2 = h - 24 - col_idx * (box_h + 8); y1 = y2 - box_h
-        fill = "FDECEC" if row["Status"] == STATUS_ERRO else "FFF4CC"
-        border = "B42318" if row["Status"] == STATUS_ERRO else "9A6700"
-        annot = FreeText(
-            text=_texto_caixa(row),
-            rect=(x1, y1, x2, y2),
-            font="Helvetica",
-            font_size="8pt",
-            font_color="111111",
-            border_color=border,
-            background_color=fill,
-        )
-        writer.add_annotation(page_number=pg, annotation=annot)
+    # Agrupa ocorrências por página previamente calculada; sem página vai para a primeira.
+    por_pg = {}
+    for _, row in df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])].iterrows():
+        pg = row.get("Página", None)
+        try:
+            pg = int(pg) if pg and not pd.isna(pg) else 1
+        except Exception:
+            pg = 1
+        por_pg.setdefault(max(1, min(pg, len(src))), []).append(row)
 
-    out = io.BytesIO(); writer.write(out); out.seek(0); return out
+    for pno, sp in enumerate(src, start=1):
+        op = out.new_page(width=sp.rect.width + painel, height=sp.rect.height)
+        op.show_pdf_page(fitz.Rect(0, 0, sp.rect.width, sp.rect.height), src, pno - 1)
+        op.draw_line((sp.rect.width, 0), (sp.rect.width, sp.rect.height), color=(0.82,0.82,0.82), width=0.7)
+        op.insert_text((sp.rect.width + 16, 24), "MIA · REVISÃO", fontsize=9, fontname="helv", color=(0.25,0.25,0.25))
+        y = 42
+        for row in por_pg.get(pno, []):
+            texto = _texto_caixa(row)
+            iserr = row["Status"] == STATUS_ERRO
+            fill = (1.0,0.94,0.94) if iserr else (1.0,0.97,0.83)
+            stroke = (0.80,0.12,0.12) if iserr else (0.62,0.43,0.0)
+            h = 108 if iserr else 88
+            if y + h > sp.rect.height - 18:
+                # Não sobrepõe: interrompe e registra continuação compacta no rodapé.
+                op.insert_text((sp.rect.width + 16, sp.rect.height - 16), "Demais apontamentos: consultar a tela/relatório MIA.", fontsize=6.5, fontname="helv", color=(0.35,0.35,0.35))
+                break
+            box = fitz.Rect(sp.rect.width + 12, y, sp.rect.width + painel - 12, y + h)
+            op.draw_rect(box, color=stroke, fill=fill, width=0.8)
+            op.insert_textbox(box + (8,8,-8,-8), texto, fontsize=7.1, fontname="helv", color=(0.10,0.10,0.10), lineheight=1.12)
+            # linha de referência quando houver bbox
+            bb = row.get("BBox", None)
+            if isinstance(bb, (tuple, list)) and len(bb) == 4:
+                try:
+                    rr = fitz.Rect(*bb)
+                    yy = min(max(rr.y0 + rr.height/2, 10), sp.rect.height-10)
+                    op.draw_line((rr.x1 + 4, yy), (sp.rect.width + 12, y + 15), color=stroke, width=0.6)
+                except Exception:
+                    pass
+            y += h + 10
+
+    return out.tobytes(garbage=3, deflate=True)
 
 
 def gerar_docx_anotado(file_bytes, df):
@@ -773,6 +934,15 @@ def main():
                 st.error(f"Erro ao ler o memorial: {e}"); return
             if not texto.strip(): st.error("O memorial não contém texto pesquisável suficiente."); return
             df = auditar_memorial(texto, base, padrao, tipo_doc, excecoes, incluir_gerais_cliente)
+            if ext == "pdf" and not df.empty:
+                paginas_loc, bboxes = [], []
+                for _, rr in df.iterrows():
+                    if rr["Status"] in [STATUS_ERRO, STATUS_ATENCAO] and rr["Área"] not in ["Especificações Gerais", "Protocolo Financiador"]:
+                        pg, bb = localizar_no_pdf(file_bytes, str(rr["Ambiente"]), str(rr["Item"]), str(rr["Texto encontrado"]))
+                    else:
+                        pg, bb = (None, None)
+                    paginas_loc.append(pg); bboxes.append(bb)
+                df["Página"] = paginas_loc; df["BBox"] = bboxes
             st.session_state.update(resultado_memorial=df, memorial_bytes=file_bytes, memorial_ext=ext, memorial_nome=memorial.name)
 
     df = st.session_state.get("resultado_memorial")
@@ -794,11 +964,21 @@ def main():
             with st.expander(titulo, expanded=row["Status"] in [STATUS_ERRO,STATUS_ATENCAO]):
                 st.markdown(f"**Área:** {row['Área']}  |  **Padrão:** {row['Padrão aplicado']}")
                 if row["Status"]==STATUS_ERRO:
+                    if st.session_state.get("memorial_ext") == "pdf" and row.get("Página", None):
+                        img = recorte_ocorrencia_pdf(st.session_state["memorial_bytes"], int(row["Página"]), row.get("BBox", None))
+                        if img:
+                            st.caption(f"Trecho do memorial · página {int(row['Página'])}")
+                            st.image(img, use_container_width=False, width=760)
                     st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
                     st.markdown(f"**Previsto:** {row['Especificação prevista']}")
-                    st.markdown(f"**Orientação:** {row['Orientação / resposta prevista']}")
+                    st.markdown(f"**O que corrigir:** {row['Orientação / resposta prevista']}")
                 elif row["Status"]==STATUS_ATENCAO:
-                    st.markdown(f"**Confirmar:** {row['Orientação / resposta prevista']}")
+                    if st.session_state.get("memorial_ext") == "pdf" and row.get("Página", None):
+                        img = recorte_ocorrencia_pdf(st.session_state["memorial_bytes"], int(row["Página"]), row.get("BBox", None))
+                        if img:
+                            st.caption(f"Trecho do memorial · página {int(row['Página'])}")
+                            st.image(img, use_container_width=False, width=760)
+                    st.markdown(f"**O que confirmar:** {row['Orientação / resposta prevista']}")
                 else:
                     st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
                     st.markdown(f"**Previsto:** {row['Especificação prevista']}")
