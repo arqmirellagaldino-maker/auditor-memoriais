@@ -656,52 +656,179 @@ def recortar_texto_por_escopo(texto, escopo):
         return "\n".join(linhas[idx:fim])
     return "\n".join(linhas[:idx])
 
+def _canon_item(nome):
+    """Reduz rótulos da planilha e do memorial ao mesmo item técnico."""
+    n = normalizar(nome)
+    if any(x in n for x in ["bancad", "louca", "tanque"]): return "bancadas_loucas"
+    if "metal" in n or "torneira" in n or "registro" in n: return "metais"
+    if "peitoril" in n: return "peitoril"
+    if "soleira" in n or "baguete" in n or "tento" in n: return "soleira_baguete"
+    if "rodape" in n: return "rodape"
+    if "parede" in n or "sanca" in n or "revestimento" in n: return "parede"
+    if "teto" in n or "forro" in n: return "teto"
+    if "piso" in n: return "piso"
+    if "janela" in n: return "janela"
+    if "porta" in n: return "porta"
+    if "esquadr" in n: return "esquadria"
+    if "ponto" in n and any(x in n for x in ["agua", "esgoto", "hidraul"]): return "hidraulica"
+    if "ponto" in n and any(x in n for x in ["luz", "forca", "tomada", "interrupt", "telecom", "interfone", "cigarra", "eletric"]): return "eletrica"
+    return n[:80]
+
+
+def _rotulo_item_documento(raw):
+    """Reconhece apenas rótulos no INÍCIO da linha; menções no corpo não contam."""
+    txt = re.sub(r"^[•▪●\-–—\s]+", "", str(raw)).strip()
+    m = re.match(r"^(Piso(?:\s+Ve[ií]culos|\s+Pedestres)?|Paredes?|Parede|Teto|Forro|Rodap[eé]|Bancadas?|Lou[cç]as?|Tanques?|Metais?|Peitoris?|Soleiras?|Baguetes?|Tentos?|Janelas?|Portas?|Esquadrias?|Revestimentos?)\s*[:\-–—]\s*(.*)$", txt, re.I)
+    if not m:
+        return None, None
+    return _canon_item(m.group(1)), m.group(2).strip()
+
+
+def _score_ambiente(doc_nome, base_nome):
+    a, b = normalizar(doc_nome), normalizar(base_nome)
+    if not a or not b: return 0.0
+    if a == b: return 1.0
+    # aliases oficiais têm prioridade sobre similaridade genérica
+    if a in aliases_ambiente(base_nome) or b in aliases_ambiente(doc_nome): return 0.96
+    ta, tb = tokens_significativos(a), tokens_significativos(b)
+    jac = len(ta & tb) / max(1, len(ta | tb))
+    seq = SequenceMatcher(None, a, b).ratio()
+    # contém nome-base completo: útil para "SANITÁRIO DA PORTARIA" etc.
+    cont = 0.88 if (len(b) >= 5 and b in a) or (len(a) >= 5 and a in b) else 0.0
+    return max(cont, 0.58 * jac + 0.42 * seq)
+
+
+def _parear_ambiente(doc_nome, regras):
+    nomes = list(dict.fromkeys(str(x).strip() for x in regras["ambiente"].dropna() if str(x).strip()))
+    if not nomes: return None, 0.0
+    pont = sorted((( _score_ambiente(doc_nome, n), n) for n in nomes), reverse=True)
+    score, nome = pont[0]
+    # trava: não associa ambientes por semelhança fraca
+    return (nome, score) if score >= 0.54 else (None, score)
+
+
+def _parear_regra_item(regras_amb, canon_item):
+    cand = regras_amb[regras_amb["item"].map(_canon_item) == canon_item]
+    if cand.empty:
+        return None
+    # se houver duplicidade, preserva a primeira ocorrência da matriz; não mistura itens distintos
+    return cand.iloc[0]
+
+
+def extrair_itens_documento(texto, regras, escopo):
+    """V6: o memorial dirige a auditoria.
+
+    Primeiro reconhece ambientes que realmente existem no documento; depois captura somente
+    rótulos técnicos explícitos dentro deles. Só então consulta a regra correspondente no R96.
+    """
+    linhas = _linhas_texto(texto)
+    itens = []
+    ambiente_doc = None
+    ambiente_base = None
+    score_amb = 0.0
+    atual = None
+
+    ignorar_cab = {
+        "areas externas", "areas internas", "areas comuns sociais", "areas comuns",
+        "unidades autonomas residenciais", "unidades autonomas", "acabamentos",
+        "revestimentos acabamentos e pintura", "area privativa", "area uso comum",
+        "equipamentos e sistemas", "especificacoes gerais"
+    }
+
+    def fechar_atual():
+        nonlocal atual
+        if atual and atual.get("valor", "").strip():
+            itens.append(atual)
+        atual = None
+
+    for ln in linhas:
+        raw, norm = ln["raw"], ln["norm"]
+        canon, valor = _rotulo_item_documento(raw)
+        if canon:
+            if ambiente_base:
+                fechar_atual()
+                atual = {
+                    "ambiente_doc": ambiente_doc, "ambiente_base": ambiente_base,
+                    "score_ambiente": score_amb, "item_canon": canon,
+                    "valor": (re.sub(r"^[•▪●\-–—\s]+", "", raw).strip()),
+                }
+            continue
+
+        # cabeçalhos curtos são candidatos a ambiente, mas só são aceitos se casarem com a base.
+        candidato = re.sub(r"^[•▪●\-–—\s]+", "", raw).strip()
+        cand_norm = normalizar(candidato)
+        parece_cab = (raw.strip().startswith(("•", "▪", "●")) or _linha_parece_novo_ambiente(raw))
+        if parece_cab and cand_norm not in ignorar_cab and len(candidato) <= 150:
+            nome_base, sc = _parear_ambiente(candidato, regras)
+            if nome_base:
+                fechar_atual()
+                ambiente_doc, ambiente_base, score_amb = candidato, nome_base, sc
+                continue
+
+        # continuação do valor do item atual; encerra se aparecer outro cabeçalho não pareado.
+        if atual:
+            if parece_cab and len(candidato) <= 150:
+                fechar_atual()
+                ambiente_doc = ambiente_base = None
+                score_amb = 0.0
+            else:
+                atual["valor"] += " " + raw.strip()
+                if len(atual["valor"]) > 1400:
+                    fechar_atual()
+    fechar_atual()
+    return itens
+
+
 def auditar_conjunto_r96(texto, base, padrao_tecnico, escopo, grupo_nome):
     resultados = []
     regras = filtrar_regras_v4(base, padrao_tecnico, escopo)
-    for _, regra in regras.iterrows():
-        trecho, achou_amb, achou_item = extrair_contexto_hierarquico(texto, regra["ambiente"], regra["item"])
-        if not achou_amb or not achou_item:
-            # Não polui a lista com toda a matriz R96. O não-verificado fica disponível
-            # apenas quando o ambiente existe mas o item não pôde ser vinculado.
-            if achou_amb:
-                resultados.append({
-                    "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
-                    "Área": escopo, "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
-                    "Texto encontrado": "Não localizado com vínculo seguro", "Especificação prevista": regra["especificacao"],
-                    "Status": STATUS_INFO, "Orientação / resposta prevista": "Sem ação automática - revisar somente se necessário.",
-                    "Observação": "Ambiente localizado, mas o item não foi identificado com segurança.", "Confiança": 0.0,
-                    "Fonte": regra["fonte"],
-                })
+    encontrados = extrair_itens_documento(texto, regras, escopo)
+
+    for ent in encontrados:
+        regras_amb = regras[regras["ambiente"] == ent["ambiente_base"]]
+        regra = _parear_regra_item(regras_amb, ent["item_canon"])
+        if regra is None:
+            # Existe um item real no memorial, mas não há item equivalente na matriz para esse ambiente.
+            resultados.append({
+                "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
+                "Área": escopo, "Ambiente": ent["ambiente_base"], "Seção": "MAPEAMENTO",
+                "Item": ent["item_canon"], "Texto encontrado": ent["valor"],
+                "Especificação prevista": "Item sem correspondência na matriz R96 para este ambiente",
+                "Status": STATUS_INFO, "Orientação / resposta prevista": "Sem ação automática.",
+                "Observação": "Item encontrado no memorial, porém sem linha equivalente no R96.",
+                "Confiança": round(float(ent["score_ambiente"]), 2),
+                "Fonte": "Padrão de Acabamentos R96",
+            })
             continue
-        status, obs, conf = avaliar_regra_v4(trecho, regra)
-        orient = "Nenhuma ação necessária." if status == STATUS_OK else (regra["especificacao"] if status == STATUS_ERRO else "Sem ação automática - vínculo insuficiente.")
+
+        status, obs, conf_txt = avaliar_regra_v4(ent["valor"], regra)
+        conf = min(float(ent["score_ambiente"]), max(float(conf_txt), 0.01))
+        orient = "Nenhuma ação necessária." if status == STATUS_OK else (regra["especificacao"] if status == STATUS_ERRO else "Sem ação automática - comparação inconclusiva.")
         resultados.append({
             "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
             "Área": escopo, "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
-            "Texto encontrado": trecho, "Especificação prevista": regra["especificacao"], "Status": status,
-            "Orientação / resposta prevista": orient, "Observação": obs, "Confiança": round(float(conf), 2), "Fonte": regra["fonte"],
+            "Texto encontrado": ent["valor"], "Especificação prevista": regra["especificacao"], "Status": status,
+            "Orientação / resposta prevista": orient, "Observação": obs,
+            "Confiança": round(conf, 2), "Fonte": regra["fonte"],
         })
     return resultados
 
 
 def auditar_base_r96_v4(texto, base, padrao_predominante, excecoes=None):
     resultados = []
-    # Sempre verifica área privativa + área comum. Escopo não é mais escolha do usuário.
+    # V6: o documento dirige a auditoria. Não cria uma linha para cada célula do R96.
     for escopo in ["Área Privativa", "Área Comum"]:
         texto_escopo = recortar_texto_por_escopo(texto, escopo)
         resultados.extend(auditar_conjunto_r96(texto_escopo, base, padrao_predominante, escopo, "Regra geral"))
 
-    # Exceções de padrão: avalia somente um recorte identificado pela descrição fornecida.
+    # Exceções continuam sendo uma segunda passagem privativa, restrita ao grupo informado.
     nt = normalizar(texto)
     for ex in excecoes or []:
         aplic = ex.get("aplicacao", "").strip()
-        if not aplic:
-            continue
+        if not aplic: continue
         termos = [t.strip() for t in re.split(r"[-–—,:]", aplic) if len(t.strip()) >= 3]
         pos = next((nt.find(normalizar(t)) for t in termos if normalizar(t) and nt.find(normalizar(t)) >= 0), -1)
-        if pos < 0:
-            continue
+        if pos < 0: continue
         recorte = nt[max(0, pos-400):min(len(nt), pos+9000)]
         resultados.extend(auditar_conjunto_r96(recorte, base, ex["padrao"], "Área Privativa", aplic))
     return resultados
@@ -950,6 +1077,7 @@ def main():
     st.markdown("---"); st.subheader("Resultado da conferência")
     nerr=int((df["Status"]==STATUS_ERRO).sum()); natt=int((df["Status"]==STATUS_ATENCAO).sum()); ninfo=int((df["Status"]==STATUS_INFO).sum()); nok=int((df["Status"]==STATUS_OK).sum())
     a,b,c,d=st.columns(4); a.metric("Divergências",nerr); b.metric("Atenções",natt); c.metric("Não verificados",ninfo); d.metric("Conformes",nok)
+    st.caption(f"Mapeamento V6: {len(df)} itens efetivamente encontrados/protocolados. Itens do R96 que não aparecem no memorial não entram como 'não verificados'.")
 
     modo = st.radio("Exibir", ["Itens que exigem ação", "Não verificados", "Conformes", "Todos"], horizontal=True)
     if modo=="Itens que exigem ação": vis=df[df["Status"].isin([STATUS_ERRO,STATUS_ATENCAO])]
