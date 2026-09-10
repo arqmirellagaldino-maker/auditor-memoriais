@@ -1,5 +1,4 @@
 import io
-import os
 import re
 import unicodedata
 from pathlib import Path
@@ -9,30 +8,17 @@ import pandas as pd
 import streamlit as st
 import pypdf
 import docx
-import fitz  # PyMuPDF: recortes visuais e PDF revisado sem sobreposição
-from pypdf.generic import DictionaryObject, NameObject, TextStringObject, ArrayObject, FloatObject, BooleanObject
+import fitz  # PyMuPDF
 from docx.enum.text import WD_COLOR_INDEX
 
 # ==============================================================================
-# MIA | MEMORIAIS — V5
-# ------------------------------------------------------------------------------
-# PRINCÍPIOS
-# 1) O PADRÃO DE ACABAMENTOS R96 é a fonte técnica principal.
-# 2) O mesmo motor técnico atende Memorial do Cliente e Memorial do Financiador.
-# 3) O Memorial do Financiador recebe uma camada adicional de protocolo da
-#    Coordenação (itens de atenção / confirmação em projeto / fora de escopo).
-# 4) "Misto" não é um quarto padrão técnico: é uma configuração que roteia
-#    trechos/grupos para Super Econômico, Econômico ou Médio.
-# 5) Quando a base técnica consegue responder, o app apresenta a especificação
-#    esperada. Não devolve apenas "verificar conforme planilhão".
+# MIA | MEMORIAIS — V7
+# Foco: vínculo confiável Área > Ambiente > Item > R96, preservando página/evidência.
 # ==============================================================================
 
 APP_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 NOME_BASE_PADRAO = "PADRÃO DE ACABAMENTOS-R96.xlsx"
-CAMINHOS_BASE = [
-    APP_DIR / NOME_BASE_PADRAO,
-    Path.cwd() / NOME_BASE_PADRAO,
-]
+CAMINHOS_BASE = [APP_DIR / NOME_BASE_PADRAO, Path.cwd() / NOME_BASE_PADRAO]
 
 PADROES_TECNICOS = ["Super Econômico", "Econômico", "Médio"]
 STATUS_OK = "🟢 Conforme"
@@ -40,125 +26,100 @@ STATUS_ERRO = "🔴 Divergência"
 STATUS_ATENCAO = "🟡 Atenção do Coordenador"
 STATUS_INFO = "⚪ Não verificado"
 
-# Termos usados apenas para evitar falsos positivos em comparação textual.
-# A especificação oficial continua sendo lida diretamente do Excel R96.
-MATERIAIS_RELEVANTES = [
-    "ceramica", "porcelanato", "granito", "marmore sintetico", "marmore",
-    "aco inox", "inox", "louca", "concreto desempenado", "cimentado",
-    "vinilico", "laminado", "ardosia", "gesso", "textura acrilica",
-    "monocapa", "aluminio", "ferro", "vidro", "pvc", "madeira",
-    "intertravado", "pedra natural", "latex pva", "latex acrilica",
+# ------------------------------------------------------------------------------
+# Protocolo adicional do financiador (não substitui o R96)
+# ------------------------------------------------------------------------------
+PROTOCOLO_CEF = [
+    ("Estrutura das torres / garagem", ["estrutura", "supraestrutura", "garagem"],
+     "Confirmar em projeto o tipo de estrutura das torres e, quando houver garagem, a solução adotada.",
+     "Orientações Coordenação CEF — pág. 2"),
+    ("Ambientes e finais de unidades", ["finais", "final", "ambientes"],
+     "Confirmar em projeto os ambientes citados e, quando houver finais/unidades, a aplicação indicada.",
+     "Orientações Coordenação CEF — págs. 4 a 6"),
+    ("Portas e janelas — dimensões", ["portas", "janelas", "esquadrias"],
+     "Confirmar no projeto de arquitetura as dimensões e a aplicabilidade das esquadrias.",
+     "Orientações Coordenação CEF — pág. 7"),
+    ("Acabamento conforme sistema estrutural", ["monocapa", "textura acrilica", "fachada"],
+     "Confirmar o sistema estrutural para validar a solução de acabamento aplicável.",
+     "Orientações Coordenação CEF — pág. 7"),
+    ("Rede e prumadas de gás", ["rede de gas", "prumada", "gas"],
+     "Confirmar em projeto hidráulico a rede/prumadas de gás e a solução aplicável.",
+     "Orientações Coordenação CEF — pág. 12"),
+    ("Pressurização das escadas", ["pressurizacao", "escada pressurizada", "sala de pressurizacao"],
+     "Confirmar no projeto se a escada é pressurizada ou ventilada e ajustar a redação quando necessário.",
+     "Orientações Coordenação CEF — pág. 12"),
+    ("Aquecimento solar", ["aquecimento solar"],
+     "Confirmar em projeto se existe previsão de aquecimento solar.",
+     "Orientações Coordenação CEF — pág. 13"),
 ]
 
-# Equivalências de nomes para localizar ambientes no memorial.
-# Não mudam a regra da planilha; servem apenas para encontrar o contexto.
-EQUIVALENCIAS_AMBIENTES = {
+# ------------------------------------------------------------------------------
+# Equivalências controladas de ambientes
+# ------------------------------------------------------------------------------
+# A associação automática só é feita quando existe evidência lexical real.
+# Estes aliases resolvem nomes usuais dos memoriais que não são idênticos ao R96.
+ALIASES_AMBIENTES_PRIV = {
+    "COZINHA": ["cozinha"],
     "APA OU STUDIO": ["apa", "studio", "estudio"],
-    "ÁREA DE SERVIÇO": ["area de servico", "a.s", "as", "lavanderia da unidade"],
-    "BANHOS": ["banho", "banheiro", "banheiros", "wc"],
+    "ÁREA DE SERVIÇO": ["area de servico", "lavanderia da unidade"],
+    "LAVATÓRIO EXTERNO": ["lavatorio externo"],
+    "BANHOS": ["banheiro", "banheiros", "banho", "banhos", "wc"],
     "DORMITÓRIOS": ["dormitorio", "dormitorios", "quarto", "quartos"],
-    "SALA": ["sala", "estar", "jantar"],
+    "SALA": ["sala", "sala de jantar/estar", "sala de jantar/estar e circulacao", "sala de estar", "sala de jantar"],
     "VARANDA COM A.S": ["varanda com a.s", "varanda com as", "varanda com area de servico"],
     "VARANDA SEM A.S": ["varanda sem a.s", "varanda sem as", "varanda"],
-    "CIRCULAÇÃO": ["circulacao", "hall interno", "corredor"],
-    "COZINHA": ["cozinha"],
+    "CIRCULAÇÃO": ["circulacao"],
 }
 
-# ==============================================================================
-# PROTOCOLO ADICIONAL — MEMORIAL DO FINANCIADOR / CEF
-# Fonte operacional: Orientações Equipe Projetos para Análise Memorial CEF.
-# Estes itens NÃO substituem a base R96. Eles acrescentam alertas e limites
-# de escopo quando a confirmação depende de projeto/coordenador.
-# ==============================================================================
+ALIASES_AMBIENTES_COMUM = {
+    "PORTARIA/ADM": ["portaria", "administracao", "administração", "adm"],
+    "BANHEIROS DE ÁREAS COMUNS E PORTARIA (torres e churrasqueiras)": [
+        "sanitario da portaria", "sanitários da portaria", "sanitarios da portaria",
+        "banheiro da portaria", "banheiros das areas comuns", "sanitarios das areas comuns",
+        "sanitários e sanitários pcd das áreas comuns", "sanitarios e sanitarios pcd das areas comuns",
+    ],
+    "ACESSO DE PEDESTRES E DE VEÍCULOS": ["acesso de pedestres e acesso de veiculos", "acesso de pedestres e de veiculos"],
+    "CALÇADA EXTERNA AO EMPREENDIMENTO E ESTACIONAMENTO DE VISITANTES": ["passeio externo de pedestres", "calcada", "calçada externa ao empreendimento"],
+    "ÁREA EXTERNA DA TORRE, HALLS EXTERNOS DE ACESSO ÀS TORRES E ÁREAS COBERTAS SEM FECHAMENTO DAS TORRES E MUROS DE DIVISA. (voltadas para a área externa)": [
+        "circulacao externa das torres", "área externa da torre", "area externa da torre"
+    ],
+    "ÁREA DA PISCINA": ["piscina adulto", "piscina infantil", "solario das piscinas", "solário das piscinas", "area da piscina"],
+    "CHURRASQUEIRA E/OU ESPAÇO GOURMET EXTERNO": ["churrasqueira", "espaco gourmet externo", "espaço gourmet externo"],
+    "COPA ou APA DO SALÃO DE FESTAS E/OU DO ESPAÇO GOURMET": ["copa do salao de festas", "apa do salao de festas", "copa ou apa do salao de festas"],
+    "COPA ou APA DE FUNCIONÁRIOS": ["apa de funcionario", "apa de funcionários", "apa de funcionarios", "copa de funcionarios"],
+    "COWORKING": ["coworking"],
+    "BEAUTY CARE": ["beauty care"],
+    "BICICLETÁRIO": ["bicicletario", "bicicletários", "bicicletarios"],
+    "DEPÓSITO DE MATERIAL DE LIMPEZA": ["deposito de material de limpeza", "dml"],
+    "DEPÓSITO DE LIXO": ["deposito de lixo"],
+    "DEPÓSITO PRIVATIVO": ["deposito privativo"],
+    "PET CARE": ["pet care"],
+    "ESPAÇO DELIVERY": ["delivery", "espaco delivery"],
+    "HALL DOS ANDARES E DO EDIFÍCIO GARAGEM": ["hall social e circulacao social dos andares", "hall dos andares"],
+    "HALLS SOCIAIS E CIRCULAÇÃO DOS TÉRREOS, SALÕES DE JOGOS, SALA DE POKER E FESTAS, ESPAÇO GOURMET, OFFICE, SPORTS BAR E SALAS DAS ÁREAS COMUNS": [
+        "salao de festas", "salão de festas", "salao de jogos", "salão de jogos", "espaco gourmet", "espaço gourmet", "office", "sports bar"
+    ],
+    "LAVANDERIA COLETIVA": ["lavanderia coletiva"],
+    "MINI MARKET": ["mini market", "mini mercado", "minimercado"],
+    "OFICINA BIKE": ["oficina de bike", "oficina bike"],
+    "SALA DE GINÁSTICA,  ESPAÇO PILATES E DEMAIS ÁREAS DE PRÁTICA DE ESPORTES E BRINQUEDOTECA": [
+        "fitness", "espaco pilates", "espaço pilates", "brinquedoteca", "sala de ginastica", "sala de ginástica"
+    ],
+    "SALA DE PRESSURIZAÇÃO DAS ESCADAS": ["sala de pressurizacao", "sala de pressurização"],
+    "SAUNA E SALA DE DESCANSO": ["sauna", "sala de descanso"],
+    "VESTIÁRIOS E BANHEIROS DAS ÁREAS TÉCNICAS": ["vestiario de funcionario", "vestiário de funcionário", "vestiarios", "vestiários"],
+    "CENTRO DE MEDIÇÃO, DG, OUTRAS ÁREAS TÉCNICAS E DEPÓSITOS e ETE": ["centro de medicao", "centro de medição", "dg", "ete", "areas tecnicas", "áreas técnicas"],
+    "BARRILETE (RESERVATÓRIOS SUPERIORES), POÇO DE ELEVADOR E CASA DE BOMBAS DA PISCINA E ÁREAS SEM USO.": [
+        "barrilete", "reservatorio superior", "reservatórios superiores", "poco de elevador", "poço de elevador", "casa de bombas"
+    ],
+    "RESERVATÓRIOS INFERIORES": ["reservatorio inferior", "reservatórios inferiores"],
+    "ESCADA COBERTA (TORRE )": ["escada e circulacao tecnica da torre", "escada coberta torre"],
+    "ESCADAS E RAMPAS DE PEDESTRES DESCOBERTAS": ["escadas e rampas de pedestres descobertas"],
+}
 
-PROTOCOLO_CEF = [
-    {
-        "id": "identificacao",
-        "titulo": "Dados de identificação do empreendimento",
-        "gatilhos": ["identificacao do empreendimento", "objeto e caracteristicas gerais", "empreendimento"],
-        "acao": "sem_conferencia",
-        "orientacao": "Dados de identificação do empreendimento não são conferidos pela equipe de Projetos.",
-        "fonte": "Orientações Coordenação CEF — pág. 2",
-    },
-    {
-        "id": "estrutura",
-        "titulo": "Estrutura das torres / garagem",
-        "gatilhos": ["supraestrutura", "estrutura", "garagem", "pre moldada", "pré-moldada"],
-        "acao": "atencao",
-        "orientacao": "Confirmar em projeto o tipo de estrutura das torres e, se houver garagem, confirmar se a solução é pré-moldada ou não.",
-        "fonte": "Orientações Coordenação CEF — pág. 2",
-    },
-    {
-        "id": "ambientes_finais",
-        "titulo": "Ambientes e finais de unidades",
-        "gatilhos": ["revestimentos", "ambientes", "final", "finais", "unidade"],
-        "acao": "atencao",
-        "orientacao": "Confirmar no projeto se os ambientes citados estão corretos. Quando houver indicação de finais/unidades, conferir também a aplicação aos finais informados.",
-        "fonte": "Orientações Coordenação CEF — págs. 4 a 6",
-    },
-    {
-        "id": "portas_janelas_dimensao",
-        "titulo": "Portas e janelas — dimensões",
-        "gatilhos": ["portas", "janelas", "esquadrias"],
-        "acao": "atencao",
-        "orientacao": "Para dimensões, prever/solicitar a redação 'conforme projeto de arquitetura'. Para janelas, seguir a mesma orientação aplicável às portas.",
-        "fonte": "Orientações Coordenação CEF — pág. 7",
-    },
-    {
-        "id": "fachada_estrutura",
-        "titulo": "Acabamento conforme sistema estrutural",
-        "gatilhos": ["fachada", "textura", "monocapa", "alvenaria estrutural", "estrutura convencional"],
-        "acao": "atencao",
-        "orientacao": "Confirmar o sistema estrutural: em alvenaria estrutural, a orientação é monocapa; em estrutura convencional, textura acrílica, conforme aplicabilidade do projeto.",
-        "fonte": "Orientações Coordenação CEF — pág. 7",
-    },
-    {
-        "id": "marcas",
-        "titulo": "Marcas / modelos",
-        "gatilhos": ["marca", "modelo", "fabricante", "fechadura", "batente"],
-        "acao": "sem_conferencia",
-        "orientacao": "Marcas, modelos, fechaduras e batentes não são objeto de conferência técnica da equipe de Projetos neste protocolo.",
-        "fonte": "Orientações Coordenação CEF — págs. 5, 7, 8, 13",
-    },
-    {
-        "id": "gas",
-        "titulo": "Rede e prumadas de gás",
-        "gatilhos": ["gas", "gás", "prumada de gas", "rede enterrada"],
-        "acao": "atencao",
-        "orientacao": "Conferir o item. Para rede enterrada de gás, prever PEAD. Quando houver prumadas de gás, indicar que serão conforme projeto de hidráulica. Não conferir marcas.",
-        "fonte": "Orientações Coordenação CEF — pág. 12",
-    },
-    {
-        "id": "pressurizacao",
-        "titulo": "Pressurização das escadas",
-        "gatilhos": ["pressurizacao", "pressurização", "escada pressurizada", "sala de pressurizacao"],
-        "acao": "atencao",
-        "orientacao": "Confirmar no projeto se há pressurização das escadas. Quando não houver, informar a condição correspondente no memorial.",
-        "fonte": "Orientações Coordenação CEF — pág. 12",
-    },
-    {
-        "id": "aquecimento_solar",
-        "titulo": "Aquecimento solar",
-        "gatilhos": ["aquecimento solar", "solar"],
-        "acao": "atencao",
-        "orientacao": "Confirmar em projeto se o empreendimento possui ou não previsão de aquecimento solar.",
-        "fonte": "Orientações Coordenação CEF — pág. 13",
-    },
-]
-
-# Seções do protocolo original explicitamente fora do escopo da equipe de Projetos.
-FORA_ESCOPO_CEF = [
-    "quantidade de apartamentos",
-    "estacionamento",
-    "padrão do empreendimento",
-    "padrao do empreendimento",
-    "memorial de infraestrutura",
-]
-
-# ==============================================================================
-# UTILITÁRIOS DE TEXTO
-# ==============================================================================
-
+# ------------------------------------------------------------------------------
+# Utilitários
+# ------------------------------------------------------------------------------
 def normalizar(texto):
     if texto is None:
         return ""
@@ -168,501 +129,115 @@ def normalizar(texto):
     return texto
 
 
-def tokens_significativos(texto):
-    stop = {
-        "de", "da", "do", "das", "dos", "e", "em", "com", "ou", "para", "por",
-        "quando", "onde", "no", "na", "nos", "nas", "um", "uma", "ao", "aos",
-        "ser", "sera", "pode", "podera", "conforme", "aplicavel", "nao", "sim",
-        "ponto", "pontos", "prever", "caso", "houver", "tipo", "sobre",
-    }
-    palavras = re.findall(r"[a-z0-9]+(?:,[0-9]+)?", normalizar(texto))
-    return {p for p in palavras if len(p) >= 3 and p not in stop}
+def tokens(texto):
+    stop = {"de","da","do","das","dos","e","em","com","ou","para","por","quando","onde","no","na","nos","nas","um","uma","ao","aos","conforme","aplicavel","ser","sera","caso","houver","sobre"}
+    return {x for x in re.findall(r"[a-z0-9]+", normalizar(texto)) if len(x) >= 3 and x not in stop}
 
 
-def similaridade_textual(a, b):
-    na, nb = normalizar(a), normalizar(b)
-    if not na or not nb:
-        return 0.0
-    ta, tb = tokens_significativos(na), tokens_significativos(nb)
-    jaccard = len(ta & tb) / max(1, len(ta | tb))
-    seq = SequenceMatcher(None, na[:1200], nb[:1200]).ratio()
-    return 0.65 * jaccard + 0.35 * seq
+def _limpar_cabecalho(txt):
+    txt = re.sub(r"^[•▪●\-–—\s]+", "", str(txt)).strip()
+    txt = re.sub(r"\s+[–—-]\s+TORRE\s+[A-Z0-9]+.*$", "", txt, flags=re.I)
+    return txt.strip(" .:-–—")
 
 
-def materiais_presentes(texto):
-    n = normalizar(texto)
-    return {m for m in MATERIAIS_RELEVANTES if m in n}
+def _bbox_union(rects):
+    if not rects:
+        return None
+    r = fitz.Rect(rects[0])
+    for rr in rects[1:]:
+        r.include_rect(fitz.Rect(rr))
+    return (r.x0, r.y0, r.x1, r.y1)
 
 
-def aliases_ambiente(nome):
-    base = normalizar(nome)
-    aliases = [base]
-    for chave, equivalentes in EQUIVALENCIAS_AMBIENTES.items():
-        if normalizar(chave) == base:
-            aliases += [normalizar(x) for x in equivalentes]
-    # termos do próprio nome composto ajudam em áreas comuns
-    if len(base) > 8:
-        aliases += [x.strip() for x in re.split(r"/| e/ou | ou |,|\(|\)", base) if len(x.strip()) > 4]
-    return list(dict.fromkeys([a for a in aliases if a]))
-
-
-def localizar_contexto(texto, ambiente, janela=1300):
-    n = normalizar(texto)
-    candidatos = []
-    for alias in aliases_ambiente(ambiente):
-        pos = n.find(alias)
-        if pos >= 0:
-            candidatos.append((pos, alias))
-    if not candidatos:
-        return "", False
-    pos, alias = min(candidatos, key=lambda x: x[0])
-    ini = max(0, pos - 200)
-    fim = min(len(n), pos + max(janela, len(alias) + 400))
-    return n[ini:fim], True
-
-
-def localizar_melhor_trecho(contexto, item, especificacao):
-    if not contexto:
-        return ""
-    partes = [p.strip() for p in re.split(r"(?<=[\.;:])\s+|\n+", contexto) if len(p.strip()) >= 8]
-    if not partes:
-        return contexto[:700]
-    alvo = f"{item} {especificacao}"
-    melhor = max(partes, key=lambda p: similaridade_textual(p, alvo))
-    return melhor[:900]
+def pagina_int(valor):
+    try:
+        if valor is None or pd.isna(valor):
+            return None
+        v = int(float(valor))
+        return v if v > 0 else None
+    except Exception:
+        return None
 
 # ==============================================================================
-# LEITURA DA BASE R96
+# Base R96
 # ==============================================================================
-
 def _achar_linha_ambientes(df):
     for i in range(min(len(df), 20)):
         if normalizar(df.iloc[i, 0]) == "ambientes":
             return i
-    raise ValueError("Não foi encontrada a linha 'AMBIENTES' na planilha.")
+    raise ValueError("Não foi encontrada a linha AMBIENTES na planilha R96.")
 
 
 def _eh_cabecalho_secao(valor, linha):
     v = normalizar(valor)
     if not v:
         return False
-    if all((x is None or str(x).strip() == "" or pd.isna(x)) for x in linha[1:]):
-        return v in {"instalacoes eletricas", "instalacoes hidraulicas", "acabamentos", "areas comuns", "area privativa"}
-    return False
+    vazios = all((x is None or (isinstance(x, float) and pd.isna(x)) or str(x).strip() == "") for x in linha[1:])
+    if not vazios:
+        return False
+    return any(k in v for k in ["instalacoes eletricas", "instalacoes hidraulicas", "acabamentos"])
 
 
 def parsear_matriz_planilha(df, padrao, escopo, nome_aba):
     regras = []
-    idx_amb = _achar_linha_ambientes(df)
+    idx = _achar_linha_ambientes(df)
     ambientes = []
-    for col in range(1, df.shape[1]):
-        valor = df.iloc[idx_amb, col]
-        ambientes.append(str(valor).strip() if valor is not None and not pd.isna(valor) else "")
-
+    for c in range(1, df.shape[1]):
+        v = df.iloc[idx, c]
+        ambientes.append("" if v is None or (isinstance(v, float) and pd.isna(v)) else str(v).strip())
     secao = "ACABAMENTOS"
-    for r in range(idx_amb + 1, len(df)):
-        item_raw = df.iloc[r, 0] if df.shape[1] else None
-        item = "" if item_raw is None or pd.isna(item_raw) else str(item_raw).strip()
+    for r in range(idx + 1, len(df)):
+        raw = df.iloc[r, 0] if df.shape[1] else None
+        item = "" if raw is None or (isinstance(raw, float) and pd.isna(raw)) else str(raw).strip()
         if not item:
             continue
-        if _eh_cabecalho_secao(item_raw, list(df.iloc[r, :])):
+        if _eh_cabecalho_secao(raw, list(df.iloc[r, :])):
             secao = item.strip().upper()
             continue
-        # descarta linhas administrativas / datas
         if normalizar(item) in {"atualizado em", "r", "r:"}:
             continue
-        for col, ambiente in enumerate(ambientes, start=1):
+        for c, ambiente in enumerate(ambientes, start=1):
             if not ambiente:
                 continue
-            valor = df.iloc[r, col] if col < df.shape[1] else None
-            if valor is None or pd.isna(valor) or not str(valor).strip():
+            v = df.iloc[r, c] if c < df.shape[1] else None
+            if v is None or (isinstance(v, float) and pd.isna(v)) or not str(v).strip():
                 continue
             regras.append({
-                "padrao": padrao,
-                "escopo": escopo,
-                "ambiente": ambiente.strip(),
-                "secao": secao,
-                "item": item.strip(),
-                "especificacao": str(valor).strip(),
+                "padrao": padrao, "escopo": escopo, "ambiente": ambiente,
+                "secao": secao, "item": item, "especificacao": str(v).strip(),
                 "fonte": f"Padrão de Acabamentos R96 — {nome_aba}",
             })
     return regras
 
 
 @st.cache_data(show_spinner=False)
-def carregar_base_r96(file_bytes=None):
-    """Lê diretamente o XLSX R96. A planilha permanece a fonte de verdade."""
-    if file_bytes is not None:
-        origem = io.BytesIO(file_bytes)
-    else:
-        caminho = next((p for p in CAMINHOS_BASE if p.exists()), None)
-        if caminho is None:
-            raise FileNotFoundError(
-                f"Base '{NOME_BASE_PADRAO}' não encontrada ao lado do app. Faça o upload da base na barra lateral."
-            )
-        origem = caminho
-
-    # O app usa pandas para leitura dinâmica da fonte técnica. Nenhuma regra
-    # de acabamento é hardcoded no Python.
-    xls = pd.ExcelFile(origem)
+def carregar_base_r96():
+    caminho = next((p for p in CAMINHOS_BASE if p.exists()), None)
+    if caminho is None:
+        raise FileNotFoundError(f"Base {NOME_BASE_PADRAO} não encontrada no repositório.")
+    xls = pd.ExcelFile(caminho)
     regras = []
-
-    mapa_abas = [
+    mapa = [
         ("SUPER ECO-ECONOMICO_PRIVATIVA", "Super Econômico", "Área Privativa"),
         ("SUPER ECO-ECONOMICO_PRIVATIVA", "Econômico", "Área Privativa"),
         ("MÉDIO_PRIVATIVA", "Médio", "Área Privativa"),
         ("ÁREA COMUM pagina 1-2", "Todos", "Área Comum"),
         ("ÁREA COMUM pagina 2-2", "Todos", "Área Comum"),
     ]
-
-    for aba, padrao, escopo in mapa_abas:
-        if aba not in xls.sheet_names:
-            continue
-        df = pd.read_excel(xls, sheet_name=aba, header=None, dtype=object)
-        regras.extend(parsear_matriz_planilha(df, padrao, escopo, aba))
-
+    for aba, pad, esc in mapa:
+        if aba in xls.sheet_names:
+            regras.extend(parsear_matriz_planilha(pd.read_excel(xls, aba, header=None, dtype=object), pad, esc, aba))
     return pd.DataFrame(regras)
 
 # ==============================================================================
-# CONFIGURAÇÃO DE EMPREENDIMENTO MISTO
+# Canonização e associação Ambiente / Item
 # ==============================================================================
-
-def padrao_do_grupo(trecho, grupos_mistos, padrao_fallback=None):
-    """Tenta rotear um trecho do memorial para o padrão cadastrado no início."""
-    nt = normalizar(trecho)
-    melhor = None
-    melhor_score = 0
-    for g in grupos_mistos or []:
-        torre = normalizar(g.get("torre", ""))
-        unidades = normalizar(g.get("unidades", ""))
-        padrao = g.get("padrao", "")
-        termos = [t for t in [torre, unidades] if t and t not in {"demais", "todas", "todos"}]
-        score = sum(1 for t in termos if t in nt)
-        # finais digitados como 01, 02, 05, 06
-        nums = re.findall(r"\b\d{1,3}\b", unidades)
-        score += sum(0.35 for num in nums if re.search(rf"\b0*{int(num)}\b", nt)) if nums else 0
-        if score > melhor_score:
-            melhor_score = score
-            melhor = padrao
-    return melhor or padrao_fallback
-
-
-def descricao_config_mista(grupos):
-    if not grupos:
-        return "Nenhum grupo configurado."
-    return " | ".join(f"{g['torre']} — {g['unidades']}: {g['padrao']}" for g in grupos)
-
-# ==============================================================================
-# EXTRAÇÃO DOS MEMORIAIS
-# ==============================================================================
-
-def extrair_texto_pdf(file_bytes):
-    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
-    return [{"pagina": i + 1, "texto": page.extract_text() or ""} for i, page in enumerate(reader.pages)]
-
-
-def extrair_texto_docx(file_bytes):
-    doc = docx.Document(io.BytesIO(file_bytes))
-    saida = []
-    for i, p in enumerate(doc.paragraphs):
-        if p.text.strip():
-            saida.append({"indice": i, "texto": p.text})
-    # inclui tabelas, muito comuns em memoriais CEF
-    for ti, tabela in enumerate(doc.tables):
-        for ri, row in enumerate(tabela.rows):
-            linha = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-            if linha:
-                saida.append({"indice": f"T{ti}-R{ri}", "texto": linha})
-    return saida
-
-# ------------------------------------------------------------------------------
-# LOCALIZAÇÃO VISUAL NO PDF
-# ------------------------------------------------------------------------------
-
-def localizar_no_pdf(file_bytes, ambiente, item, trecho=""):
-    """Retorna página (1-based) e retângulo aproximado do item no PDF.
-    A busca é deliberadamente conservadora: primeiro ambiente, depois rótulo do item.
-    """
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        aliases_amb = aliases_ambiente(ambiente)
-        aliases_it = _aliases_item_rotulo(item) if '_aliases_item_rotulo' in globals() else [normalizar(item)]
-        for pno, page in enumerate(doc):
-            txt = normalizar(page.get_text("text"))
-            if not any(a in txt for a in aliases_amb):
-                continue
-            amb_rects = []
-            for a in aliases_amb:
-                amb_rects += page.search_for(a, quads=False)
-            for it in aliases_it:
-                rects = page.search_for(it, quads=False)
-                if rects:
-                    # prefere ocorrência abaixo do cabeçalho do ambiente
-                    if amb_rects:
-                        ay = min(r.y0 for r in amb_rects)
-                        abaixo = [r for r in rects if r.y0 >= ay - 4]
-                        if abaixo:
-                            r = min(abaixo, key=lambda x: x.y0)
-                            return pno + 1, (r.x0, r.y0, r.x1, r.y1)
-                    r = rects[0]
-                    return pno + 1, (r.x0, r.y0, r.x1, r.y1)
-        return None, None
-    except Exception:
-        return None, None
-
-
-def recorte_ocorrencia_pdf(file_bytes, pagina, bbox=None, zoom=1.7):
-    if not pagina:
-        return None
-    try:
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        page = doc[pagina - 1]
-        if bbox:
-            r = fitz.Rect(*bbox)
-            clip = fitz.Rect(max(0, r.x0 - 55), max(0, r.y0 - 90), min(page.rect.width, r.x1 + 360), min(page.rect.height, r.y1 + 135))
-        else:
-            clip = page.rect
-        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
-        return pix.tobytes("png")
-    except Exception:
-        return None
-
-# ==============================================================================
-# MOTOR DE CONFERÊNCIA R96
-# ==============================================================================
-
-# ==============================================================================
-# MOTOR DE PAREAMENTO ESTRUTURAL — V5
-# ==============================================================================
-
-ITEM_EQUIVALENCIAS = {
-    "piso": ["piso", "pisos"],
-    "parede": ["parede", "paredes", "revestimento de parede"],
-    "teto": ["teto", "forro", "revestimento de teto"],
-    "rodape": ["rodape", "rodapé"],
-    "bancada": ["bancada", "bancadas"],
-    "louca": ["louca", "louças", "louca sanitaria", "louças sanitárias"],
-    "metais": ["metal", "metais", "torneira", "misturador", "registro"],
-    "porta": ["porta", "portas"],
-    "janela": ["janela", "janelas"],
-    "peitoril": ["peitoril", "peitoris"],
-    "soleira": ["soleira", "soleiras"],
-    "guarda corpo": ["guarda corpo", "guarda-corpo"],
-    "portao": ["portao", "portão", "portoes", "portões"],
-    "ponto de luz": ["ponto de luz", "pontos de luz", "iluminacao", "iluminação"],
-    "interruptor": ["interruptor", "interruptores"],
-    "tomada": ["tomada", "tomadas", "ponto de forca", "ponto de força"],
-    "agua fria": ["agua fria", "água fria"],
-    "agua quente": ["agua quente", "água quente"],
-    "esgoto": ["esgoto", "ponto de esgoto"],
-    "gas": ["gas", "gás", "ponto de gas", "ponto de gás"],
-}
-
-
-def aliases_item(item):
-    n = normalizar(item)
-    aliases = [n]
-    for chave, vals in ITEM_EQUIVALENCIAS.items():
-        if chave in n or n in chave:
-            aliases.extend(normalizar(v) for v in vals)
-    # O primeiro núcleo nominal costuma ser suficiente para títulos de linhas da matriz.
-    for chave, vals in ITEM_EQUIVALENCIAS.items():
-        if chave in n:
-            aliases.extend(normalizar(v) for v in vals)
-    return list(dict.fromkeys(a for a in aliases if len(a) >= 3))
-
-
-def _linhas_texto(texto):
-    linhas = []
-    for i, raw in enumerate(str(texto).splitlines()):
-        limpo = re.sub(r"\s+", " ", raw).strip()
-        if limpo:
-            linhas.append({"i": i, "raw": limpo, "norm": normalizar(limpo)})
-    return linhas
-
-
-def _linha_eh_ambiente(linha_norm, ambiente):
-    # Ambiente precisa aparecer como cabeçalho/linha curta, não perdido dentro de uma descrição.
-    # Remove marcadores típicos dos memoriais comerciais (•, ▪, hífen).
-    ln = re.sub(r"^[^a-z0-9]+", "", linha_norm).strip()
-    for alias in aliases_ambiente(ambiente):
-        if ln == alias:
-            return True
-        if len(ln) <= 120 and (ln.startswith(alias + " ") or ln.startswith(alias + " -") or ln.startswith(alias + " –")):
-            return True
-    return False
-
-
-def _linha_parece_novo_ambiente(raw):
-    txt = raw.strip()
-    if txt.startswith(("•", "▪", "- ")) and len(txt) <= 140:
-        return True
-    letras = [c for c in txt if c.isalpha()]
-    if len(letras) >= 4 and len(txt) <= 95:
-        prop = sum(c.isupper() for c in letras) / len(letras)
-        if prop >= 0.82 and not re.match(r"^(PISO|PAREDE|PAREDES|TETO|FORRO|RODAP[EÉ]|BANCADA|LOU[CÇ]A|METAIS?|PORTA|JANELA|PEITORIL|SOLEIRA|EQUIPAMENTOS?)\b", txt, re.I):
-            return True
-    return False
-
-
-def _aliases_item_rotulo(item):
-    # Núcleos de item aceitos somente quando usados como RÓTULO.
-    n = normalizar(item)
-    nucleos = []
-    for chave, vals in ITEM_EQUIVALENCIAS.items():
-        if chave in n or n in chave:
-            nucleos.extend([chave] + vals)
-    # Casos compostos da planilha.
-    if "bancad" in n or "louca" in n or "tanque" in n:
-        nucleos += ["bancada", "bancadas", "louca", "loucas", "tanque", "tanques"]
-    if "parede" in n or "sanca" in n:
-        nucleos += ["parede", "paredes", "sanca", "sancas", "revestimento"]
-    if "piso" in n:
-        nucleos += ["piso", "pisos"]
-    if "rodape" in n:
-        nucleos += ["rodape", "rodapes"]
-    if "soleira" in n:
-        nucleos += ["soleira", "soleiras"]
-    if not nucleos:
-        nucleos = [n]
-    return list(dict.fromkeys(normalizar(x) for x in nucleos if len(normalizar(x)) >= 3))
-
-
-def _linha_tem_rotulo_item(linha_norm, item):
-    for alias in _aliases_item_rotulo(item):
-        # Fundamental: o nome do item deve estar no começo da linha/campo e seguido por ':' ou '-'.
-        if re.match(r"^" + re.escape(alias) + r"\s*[:\-–—]", linha_norm):
-            return True
-        # Em algumas extrações o rótulo vem sozinho na linha.
-        if linha_norm == alias:
-            return True
-    return False
-
-
-def extrair_contexto_hierarquico(texto, ambiente, item, janela_ambiente=0):
-    """Pareamento estrutural V5.
-
-    1) encontra o AMBIENTE como cabeçalho;
-    2) limita o bloco até o PRÓXIMO cabeçalho de ambiente;
-    3) encontra o ITEM somente como rótulo explícito dentro desse bloco;
-    4) captura o valor até o próximo rótulo de item.
-
-    Assim, a palavra 'bancada' dentro da descrição de PAREDE nunca vira o item Bancada.
-    """
-    linhas = _linhas_texto(texto)
-    if not linhas:
-        return "", False, False
-
-    pos_ambientes = [k for k, ln in enumerate(linhas) if _linha_eh_ambiente(ln["norm"], ambiente)]
-    if not pos_ambientes:
-        return "", False, False
-
-    for pos in pos_ambientes:
-        fim = len(linhas)
-        for j in range(pos + 1, len(linhas)):
-            if _linha_parece_novo_ambiente(linhas[j]["raw"]):
-                fim = j
-                break
-        bloco = linhas[pos + 1:fim]
-        if not bloco:
-            continue
-
-        idx_item = next((j for j, ln in enumerate(bloco) if _linha_tem_rotulo_item(ln["norm"], item)), None)
-        if idx_item is None:
-            continue
-
-        capt = [bloco[idx_item]["raw"]]
-        for j in range(idx_item + 1, len(bloco)):
-            ln = bloco[j]
-            # Próximo rótulo técnico encerra o campo atual.
-            if any(_linha_tem_rotulo_item(ln["norm"], chave) for chave in ITEM_EQUIVALENCIAS):
-                break
-            if re.match(r"^(Piso|Paredes?|Teto|Forro|Rodap[eé]|Bancadas?|Lou[cç]as?|Tanque|Metais?|Portas?|Janelas?|Peitoris?|Soleiras?|Equipamentos?)\s*[:\-–—]", ln["raw"], re.I):
-                break
-            capt.append(ln["raw"])
-            if len(" ".join(capt)) > 950:
-                break
-        trecho = " ".join(capt).strip()
-        return trecho, True, True
-
-    return "", True, False
-
-
-def avaliar_regra_v4(trecho, regra):
-    esp = str(regra["especificacao"]).strip()
-    nt, ne = normalizar(trecho), normalizar(esp)
-    if not trecho:
-        return STATUS_INFO, "Item não localizado com vínculo seguro entre ambiente e item.", 0.0
-
-    # Não aplicável só é conforme quando o próprio memorial também o declara.
-    if "nao aplicavel" in ne:
-        if "nao aplicavel" in nt:
-            return STATUS_OK, "Memorial e R96 indicam item não aplicável.", 1.0
-        return STATUS_INFO, "A base indica condição não aplicável, mas o trecho não permite confirmar a mesma condição.", 0.3
-
-    sim = similaridade_textual(nt, ne)
-    te, tt = tokens_significativos(ne), tokens_significativos(nt)
-    cobertura = len(te & tt) / max(1, len(te))
-
-    # Correspondência literal ou técnica forte => conforme.
-    if ne in nt or nt in ne or cobertura >= 0.62 or sim >= 0.56:
-        return STATUS_OK, "Descrição tecnicamente compatível com a base R96.", max(sim, cobertura)
-
-    mats_e = materiais_presentes(ne)
-    mats_t = materiais_presentes(nt)
-    # Se o memorial escolhe uma das alternativas materiais explicitamente previstas, considera conforme.
-    if mats_e and mats_t and (mats_t <= mats_e or any(m in nt and m in ne for m in sorted(mats_e, key=len, reverse=True))):
-        extras = {m for m in mats_t if m not in mats_e}
-        if not extras:
-            return STATUS_OK, "Material/solução encontrada está entre as alternativas previstas no R96.", max(sim, cobertura, 0.75)
-    # Vermelho somente com conflito material explícito, no ambiente + item já ancorados.
-    if mats_e and mats_t and mats_e.isdisjoint(mats_t):
-        return STATUS_ERRO, f"Divergência material objetiva: memorial indica {', '.join(sorted(mats_t))}; R96 prevê {', '.join(sorted(mats_e))}.", max(sim, cobertura)
-
-    # Ausência de prova de conformidade NÃO vira atenção do coordenador.
-    return STATUS_INFO, "Não foi possível concluir a comparação com segurança; não classificado como divergência.", max(sim, cobertura)
-
-
-def filtrar_regras_v4(base, padrao, escopo):
-    if escopo == "Área Comum":
-        return base[base["escopo"] == "Área Comum"].copy()
-    return base[(base["escopo"] == "Área Privativa") & (base["padrao"] == padrao)].copy()
-
-
-
-def recortar_texto_por_escopo(texto, escopo):
-    """Separa Área Comum e Área Privativa quando o memorial possui um divisor claro.
-    Evita, por exemplo, que SALA privativa seja pareada com SALÃO/SALA de área comum.
-    Em memoriais CEF, que repetem tabelas de área privativa/comum em várias seções,
-    mantém o texto integral para não perder blocos técnicos.
-    """
-    n = normalizar(texto)
-    marcadores_priv = ["unidades autonomas residenciais", "unidades autonomas", "apartamentos - area privativa"]
-    pos = -1
-    for m in marcadores_priv:
-        p = n.find(m)
-        if p >= 0:
-            pos = p if pos < 0 else min(pos, p)
-    if pos < 0:
-        return texto
-    # converte posição normalizada em aproximação na string original via busca sem acentos simples
-    # Para o memorial comercial, o marcador aparece literalmente em linha própria.
-    linhas = str(texto).splitlines()
-    idx = next((i for i,l in enumerate(linhas) if any(m in normalizar(l) for m in marcadores_priv)), None)
-    if idx is None:
-        return texto
-    if escopo == "Área Privativa":
-        fim = next((j for j in range(idx+1, len(linhas)) if "especificacoes gerais" in normalizar(linhas[j])), len(linhas))
-        return "\n".join(linhas[idx:fim])
-    return "\n".join(linhas[:idx])
-
-def _canon_item(nome):
-    """Reduz rótulos da planilha e do memorial ao mesmo item técnico."""
+def canon_item(nome):
     n = normalizar(nome)
     if any(x in n for x in ["bancad", "louca", "tanque"]): return "bancadas_loucas"
-    if "metal" in n or "torneira" in n or "registro" in n: return "metais"
+    if "metal" in n or "torneira" in n or "misturador" in n or "registro" in n: return "metais"
     if "peitoril" in n: return "peitoril"
-    if "soleira" in n or "baguete" in n or "tento" in n: return "soleira_baguete"
+    if any(x in n for x in ["soleira", "baguete", "tento", "meia soleira", " bit "]): return "soleira_baguete"
     if "rodape" in n: return "rodape"
     if "parede" in n or "sanca" in n or "revestimento" in n: return "parede"
     if "teto" in n or "forro" in n: return "teto"
@@ -670,355 +245,661 @@ def _canon_item(nome):
     if "janela" in n: return "janela"
     if "porta" in n: return "porta"
     if "esquadr" in n: return "esquadria"
-    if "ponto" in n and any(x in n for x in ["agua", "esgoto", "hidraul"]): return "hidraulica"
-    if "ponto" in n and any(x in n for x in ["luz", "forca", "tomada", "interrupt", "telecom", "interfone", "cigarra", "eletric"]): return "eletrica"
-    return n[:80]
+    if "agua fria" in n: return "agua_fria"
+    if "agua quente" in n: return "agua_quente"
+    if "esgoto" in n: return "esgoto"
+    if "ponto" in n and "luz" in n: return "pontos_luz"
+    if "interrupt" in n: return "interruptor"
+    if any(x in n for x in ["tomada", "forca", "força"]): return "tomada_forca"
+    if "telecom" in n: return "telecom"
+    if "interfone" in n: return "interfone"
+    if "cigarra" in n: return "cigarra"
+    if "gas" in n: return "gas"
+    return n[:100]
 
 
-def _rotulo_item_documento(raw):
-    """Reconhece apenas rótulos no INÍCIO da linha; menções no corpo não contam."""
-    txt = re.sub(r"^[•▪●\-–—\s]+", "", str(raw)).strip()
-    m = re.match(r"^(Piso(?:\s+Ve[ií]culos|\s+Pedestres)?|Paredes?|Parede|Teto|Forro|Rodap[eé]|Bancadas?|Lou[cç]as?|Tanques?|Metais?|Peitoris?|Soleiras?|Baguetes?|Tentos?|Janelas?|Portas?|Esquadrias?|Revestimentos?)\s*[:\-–—]\s*(.*)$", txt, re.I)
-    if not m:
-        return None, None
-    return _canon_item(m.group(1)), m.group(2).strip()
+ROTULOS_CLIENTE = [
+    "Piso Veículos", "Piso Pedestres", "Piso", "Paredes", "Parede", "Teto", "Forro", "Rodapé",
+    "Bancada", "Bancadas", "Louça", "Louças", "Tanque", "Tanques", "Metais", "Peitoril", "Peitoris",
+    "Soleira", "Soleiras", "Baguete", "Baguetes", "Tento", "Tentos", "Janela", "Janelas", "Porta", "Portas", "Esquadrias",
+]
+ROT_RE = re.compile(r"^(" + "|".join(re.escape(x) for x in sorted(ROTULOS_CLIENTE, key=len, reverse=True)) + r")\s*[:\-–—]\s*(.*)$", re.I)
+STOP_RE = re.compile(r"^(Equipamentos?|Fechamento|Borda|Revestimento|Comunicação|Interfone|Ar[ -]?condicionado)\s*[:\-–—]", re.I)
 
 
-def _score_ambiente(doc_nome, base_nome):
-    a, b = normalizar(doc_nome), normalizar(base_nome)
-    if not a or not b: return 0.0
-    if a == b: return 1.0
-    # aliases oficiais têm prioridade sobre similaridade genérica
-    if a in aliases_ambiente(base_nome) or b in aliases_ambiente(doc_nome): return 0.96
-    ta, tb = tokens_significativos(a), tokens_significativos(b)
-    jac = len(ta & tb) / max(1, len(ta | tb))
+def aliases_do_ambiente(base_nome, escopo):
+    mapa = ALIASES_AMBIENTES_PRIV if escopo == "Área Privativa" else ALIASES_AMBIENTES_COMUM
+    vals = [base_nome]
+    vals += mapa.get(base_nome, [])
+    return list(dict.fromkeys(normalizar(v) for v in vals if v))
+
+
+def score_ambiente(doc_nome, base_nome, escopo):
+    a, b = normalizar(_limpar_cabecalho(doc_nome)), normalizar(base_nome)
+    if not a or not b:
+        return 0.0
+    aliases = aliases_do_ambiente(base_nome, escopo)
+    # aliases exatos/contidos têm prioridade absoluta
+    if a in aliases:
+        return 1.0
+    if any(len(x) >= 5 and (a == x or a in x or x in a) for x in aliases):
+        return 0.95
+    ta, tb = tokens(a), tokens(b)
+    inter = ta & tb
+    if not inter:
+        return 0.0  # trava principal: palavras desconexas nunca são pareadas
+    jac = len(inter) / max(1, len(ta | tb))
+    cov = len(inter) / max(1, min(len(ta), len(tb)))
     seq = SequenceMatcher(None, a, b).ratio()
-    # contém nome-base completo: útil para "SANITÁRIO DA PORTARIA" etc.
-    cont = 0.88 if (len(b) >= 5 and b in a) or (len(a) >= 5 and a in b) else 0.0
-    return max(cont, 0.58 * jac + 0.42 * seq)
+    return 0.45 * cov + 0.35 * jac + 0.20 * seq
 
 
-def _parear_ambiente(doc_nome, regras):
-    nomes = list(dict.fromkeys(str(x).strip() for x in regras["ambiente"].dropna() if str(x).strip()))
-    if not nomes: return None, 0.0
-    pont = sorted((( _score_ambiente(doc_nome, n), n) for n in nomes), reverse=True)
-    score, nome = pont[0]
-    # trava: não associa ambientes por semelhança fraca
-    return (nome, score) if score >= 0.54 else (None, score)
+def parear_ambiente(doc_nome, regras, escopo):
+    nomes = list(dict.fromkeys(str(x) for x in regras["ambiente"].dropna()))
+    if not nomes:
+        return None, 0.0
+    scored = sorted(((score_ambiente(doc_nome, n, escopo), n) for n in nomes), reverse=True)
+    s1, n1 = scored[0]
+    s2 = scored[1][0] if len(scored) > 1 else 0.0
+    # exige confiança alta OU alias forte; e evita empate ambíguo
+    if s1 < 0.72 or (s1 < 0.94 and s1 - s2 < 0.10):
+        return None, s1
+    return n1, s1
 
 
-def _parear_regra_item(regras_amb, canon_item):
-    cand = regras_amb[regras_amb["item"].map(_canon_item) == canon_item]
-    if cand.empty:
+def parear_regra_item(regras_amb, canon):
+    if regras_amb.empty:
         return None
-    # se houver duplicidade, preserva a primeira ocorrência da matriz; não mistura itens distintos
-    return cand.iloc[0]
+    cands = regras_amb[regras_amb["item"].map(canon_item) == canon]
+    return None if cands.empty else cands.iloc[0]
 
+# ==============================================================================
+# Extração PDF Cliente — com página + bbox + escopo real
+# ==============================================================================
+def linhas_pdf(file_bytes):
+    """Reconstrói linhas lógicas do PDF.
 
-def extrair_itens_documento(texto, regras, escopo):
-    """V6: o memorial dirige a auditoria.
-
-    Primeiro reconhece ambientes que realmente existem no documento; depois captura somente
-    rótulos técnicos explícitos dentro deles. Só então consulta a regra correspondente no R96.
+    Em muitos memoriais o rótulo e o valor são dois blocos na MESMA altura
+    (ex.: 'Piso:' em x=99 e 'Cerâmica' em x=191). A V6 tratava isso como
+    duas linhas distintas e perdia quase todos os itens. Aqui agrupamos
+    fragmentos com y semelhante e concatenamos da esquerda para a direita.
     """
-    linhas = _linhas_texto(texto)
-    itens = []
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    saida = []
+    for pno, page in enumerate(doc, start=1):
+        d = page.get_text("dict")
+        frags = []
+        for block in d.get("blocks", []):
+            if "lines" not in block:
+                continue
+            for line in block["lines"]:
+                spans = line.get("spans", [])
+                txt = "".join(s.get("text", "") for s in spans).strip()
+                if not txt:
+                    continue
+                bb = _bbox_union([sp.get("bbox") for sp in spans if sp.get("bbox")])
+                if bb:
+                    frags.append({"raw": re.sub(r"\s+", " ", txt).strip(), "bbox": bb})
+        frags.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))
+        grupos = []
+        tol_y = 2.2
+        for f in frags:
+            yc = (f["bbox"][1] + f["bbox"][3]) / 2
+            alvo = None
+            for g in reversed(grupos[-5:]):
+                if abs(yc - g["yc"]) <= tol_y:
+                    alvo = g
+                    break
+            if alvo is None:
+                grupos.append({"yc": yc, "frags": [f]})
+            else:
+                alvo["frags"].append(f)
+                ys = [((z["bbox"][1]+z["bbox"][3])/2) for z in alvo["frags"]]
+                alvo["yc"] = sum(ys)/len(ys)
+        for g in grupos:
+            fs = sorted(g["frags"], key=lambda x: x["bbox"][0])
+            raw = " ".join(x["raw"] for x in fs).strip()
+            bb = _bbox_union([x["bbox"] for x in fs])
+            saida.append({"page": pno, "raw": raw, "bbox": bb})
+    return saida
+
+
+def _marcador_escopo(n):
+    if any(x in n for x in ["unidades autonomas residenciais", "area privativa"]):
+        return "Área Privativa"
+    if any(x in n for x in ["areas comuns sociais", "area comum", "area uso comum"]):
+        return "Área Comum"
+    if "especificacoes gerais" in n:
+        return "Geral"
+    return None
+
+
+def _parece_ambiente_cliente(raw):
+    txt = _limpar_cabecalho(raw)
+    if not txt or len(txt) > 130:
+        return False
+    n = normalizar(txt)
+    if n in {"areas externas", "areas internas", "areas comuns sociais", "areas comuns", "unidades autonomas residenciais", "unidades autonomas", "especificacoes gerais"}:
+        return False
+    letras = [c for c in txt if c.isalpha()]
+    caps = (sum(c.isupper() for c in letras) / max(1, len(letras))) if letras else 0
+    return raw.strip().startswith(("•","▪","●")) or caps >= 0.78
+
+
+def extrair_cliente_pdf(file_bytes, base, padrao):
+    linhas = linhas_pdf(file_bytes)
+    resultados = []
+    escopo = "Área Comum"  # memorial comercial normalmente inicia nas áreas comuns
     ambiente_doc = None
     ambiente_base = None
     score_amb = 0.0
     atual = None
 
-    ignorar_cab = {
-        "areas externas", "areas internas", "areas comuns sociais", "areas comuns",
-        "unidades autonomas residenciais", "unidades autonomas", "acabamentos",
-        "revestimentos acabamentos e pintura", "area privativa", "area uso comum",
-        "equipamentos e sistemas", "especificacoes gerais"
-    }
-
-    def fechar_atual():
+    def fechar():
         nonlocal atual
-        if atual and atual.get("valor", "").strip():
-            itens.append(atual)
+        if atual and atual["valor"].strip() and ambiente_base:
+            resultados.append(atual)
         atual = None
 
     for ln in linhas:
-        raw, norm = ln["raw"], ln["norm"]
-        canon, valor = _rotulo_item_documento(raw)
-        if canon:
-            if ambiente_base:
-                fechar_atual()
-                atual = {
-                    "ambiente_doc": ambiente_doc, "ambiente_base": ambiente_base,
-                    "score_ambiente": score_amb, "item_canon": canon,
-                    "valor": (re.sub(r"^[•▪●\-–—\s]+", "", raw).strip()),
-                }
+        raw, n = ln["raw"], normalizar(ln["raw"])
+        mk = _marcador_escopo(n)
+        if mk:
+            fechar()
+            escopo = mk
+            ambiente_doc = ambiente_base = None
+            score_amb = 0.0
+            continue
+        if escopo == "Geral":
             continue
 
-        # cabeçalhos curtos são candidatos a ambiente, mas só são aceitos se casarem com a base.
-        candidato = re.sub(r"^[•▪●\-–—\s]+", "", raw).strip()
-        cand_norm = normalizar(candidato)
-        parece_cab = (raw.strip().startswith(("•", "▪", "●")) or _linha_parece_novo_ambiente(raw))
-        if parece_cab and cand_norm not in ignorar_cab and len(candidato) <= 150:
-            nome_base, sc = _parear_ambiente(candidato, regras)
-            if nome_base:
-                fechar_atual()
-                ambiente_doc, ambiente_base, score_amb = candidato, nome_base, sc
-                continue
+        m = ROT_RE.match(_limpar_cabecalho(raw))
+        if m and ambiente_base:
+            fechar()
+            atual = {
+                "escopo": escopo, "ambiente_doc": ambiente_doc, "ambiente_base": ambiente_base,
+                "score_ambiente": score_amb, "item_canon": canon_item(m.group(1)),
+                "rotulo": m.group(1), "valor": f"{m.group(1)}: {m.group(2).strip()}".strip(),
+                "page": ln["page"], "bbox": ln["bbox"],
+            }
+            continue
 
-        # continuação do valor do item atual; encerra se aparecer outro cabeçalho não pareado.
+        if _parece_ambiente_cliente(raw):
+            regras_esc = base[base["escopo"] == escopo]
+            if escopo == "Área Privativa":
+                regras_esc = regras_esc[regras_esc["padrao"] == padrao]
+            nome, sc = parear_ambiente(_limpar_cabecalho(raw), regras_esc, escopo)
+            fechar()
+            ambiente_doc = _limpar_cabecalho(raw)
+            ambiente_base = nome
+            score_amb = sc
+            continue
+
         if atual:
-            if parece_cab and len(candidato) <= 150:
-                fechar_atual()
-                ambiente_doc = ambiente_base = None
-                score_amb = 0.0
+            # não absorve outro campo (Equipamentos, Fechamento, Borda...) no valor atual.
+            if ROT_RE.match(_limpar_cabecalho(raw)) or STOP_RE.match(_limpar_cabecalho(raw)) or _parece_ambiente_cliente(raw):
+                fechar()
             else:
                 atual["valor"] += " " + raw.strip()
-                if len(atual["valor"]) > 1400:
-                    fechar_atual()
-    fechar_atual()
-    return itens
+                if atual["bbox"] and ln["page"] == atual["page"] and ln["bbox"]:
+                    atual["bbox"] = _bbox_union([atual["bbox"], ln["bbox"]])
+                if len(atual["valor"]) > 1300:
+                    fechar()
+    fechar()
+    return resultados
+
+# ==============================================================================
+# Extração PDF CEF — usa as tabelas do próprio PDF
+# ==============================================================================
+def _split_piso_rodape_soleira(texto):
+    """Separa a célula combinada do CEF em itens técnicos quando o texto permite."""
+    t = re.sub(r"\s+", " ", str(texto or "")).strip()
+    if not t:
+        return []
+    partes = re.split(r"(?<=[\.;])\s+", t)
+    grupos = {"piso": [], "rodape": [], "soleira_baguete": []}
+    for p in partes:
+        np = normalizar(p)
+        if any(x in np for x in ["rodape"]): grupos["rodape"].append(p)
+        elif any(x in np for x in ["soleira", "baguete", "tento"]): grupos["soleira_baguete"].append(p)
+        else: grupos["piso"].append(p)
+    out = []
+    for k, arr in grupos.items():
+        if arr:
+            out.append((k, " ".join(arr)))
+    return out
 
 
-def auditar_conjunto_r96(texto, base, padrao_tecnico, escopo, grupo_nome):
-    resultados = []
-    regras = filtrar_regras_v4(base, padrao_tecnico, escopo)
-    encontrados = extrair_itens_documento(texto, regras, escopo)
+def _header_canon(h):
+    n = normalizar(h)
+    if "piso" in n and ("rodape" in n or "soleira" in n): return "piso_combo"
+    if n == "parede" or "parede" in n: return "parede"
+    if n == "teto" or "teto" in n: return "teto"
+    if "peitoril" in n: return "peitoril"
+    if "agua fria" in n: return "agua_fria"
+    if "agua quente" in n: return "agua_quente"
+    if "esgoto" in n: return "esgoto"
+    if "pontos de luz" in n or "ponto de luz" in n: return "pontos_luz"
+    if "interrupt" in n: return "interruptor"
+    if "forca" in n or "tomada" in n: return "tomada_forca"
+    if "telecom" in n: return "telecom"
+    if "interfone" in n: return "interfone"
+    if "cigarra" in n: return "cigarra"
+    return None
 
-    for ent in encontrados:
-        regras_amb = regras[regras["ambiente"] == ent["ambiente_base"]]
-        regra = _parear_regra_item(regras_amb, ent["item_canon"])
+
+def extrair_cef_pdf(file_bytes, base, padrao):
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    registros = []
+    for pno, page in enumerate(doc, start=1):
+        try:
+            finder = page.find_tables()
+            tabelas = finder.tables
+        except Exception:
+            tabelas = []
+        for tab in tabelas:
+            data = tab.extract()
+            if not data or len(data) < 3:
+                continue
+            # localiza linha de cabeçalho AMBIENTE
+            hi = next((i for i, r in enumerate(data[:5]) if any("ambiente" == normalizar(c) for c in r if c)), None)
+            if hi is None:
+                continue
+            hdr = data[hi]
+            if len(hdr) < 3:
+                continue
+            # normaliza cabeçalhos; a coluna 1 normalmente é o ambiente (col 0 carrega o escopo)
+            item_cols = {}
+            for ci, h in enumerate(hdr):
+                if ci < 2 or not h:
+                    continue
+                can = _header_canon(h)
+                if can:
+                    item_cols[ci] = can
+            if not item_cols:
+                continue
+            escopo = None
+            for row in data[hi+1:]:
+                if len(row) < 2:
+                    continue
+                esc_cell = normalizar(row[0]) if row[0] else ""
+                if "area privativa" in esc_cell:
+                    escopo = "Área Privativa"
+                elif "area comum" in esc_cell or "area uso comum" in esc_cell:
+                    escopo = "Área Comum"
+                if escopo not in ["Área Privativa", "Área Comum"]:
+                    continue
+                amb_doc = re.sub(r"\s+", " ", str(row[1] or "")).strip()
+                if not amb_doc:
+                    continue
+                regras_esc = base[base["escopo"] == escopo]
+                if escopo == "Área Privativa":
+                    regras_esc = regras_esc[regras_esc["padrao"] == padrao]
+                amb_base, sc = parear_ambiente(amb_doc, regras_esc, escopo)
+                if not amb_base:
+                    continue
+                # bbox de evidência: ambiente na página; suficiente para recorte visual do card
+                rects = page.search_for(amb_doc.replace("\n", " "))
+                bb = _bbox_union(rects[:1]) if rects else None
+                for ci, can in item_cols.items():
+                    if ci >= len(row) or not row[ci]:
+                        continue
+                    cell = re.sub(r"\s+", " ", str(row[ci])).strip()
+                    if not cell:
+                        continue
+                    itens = _split_piso_rodape_soleira(cell) if can == "piso_combo" else [(can, cell)]
+                    for item_can, valor in itens:
+                        registros.append({
+                            "escopo": escopo, "ambiente_doc": amb_doc, "ambiente_base": amb_base,
+                            "score_ambiente": sc, "item_canon": item_can, "rotulo": item_can,
+                            "valor": valor, "page": pno, "bbox": bb,
+                        })
+    return registros
+
+# ==============================================================================
+# Comparação técnica
+# ==============================================================================
+MATERIAIS = [
+    "ceramica", "porcelanato", "granito", "marmore sintetico", "marmore", "aco inox", "louca",
+    "concreto desempenado", "cimentado", "vinilico", "laminado", "ardosia", "gesso", "textura acrilica",
+    "monocapa", "aluminio", "ferro", "vidro", "madeira", "intertravado", "pedra natural", "caiação", "caiacao",
+]
+
+
+def materiais(texto):
+    n = normalizar(texto)
+    # inox é sinônimo de aço inox para comparação
+    if "inox" in n and "aco inox" not in n:
+        n += " aco inox"
+    return {m for m in MATERIAIS if m in n}
+
+
+def caracteristicas_revestimento(texto):
+    n = normalizar(texto)
+    feats = set()
+    if re.search(r"piso\s+ao\s+teto|do\s+piso\s+ao\s+teto", n): feats.add("piso_teto")
+    if re.search(r"1[,\.]?50\s*m|1\s*,\s*50", n): feats.add("altura_150")
+    if "acima da bancada" in n: feats.add("acima_bancada")
+    if re.search(r"2\s*(?:ou|a)\s*3\s*fiadas|duas\s*(?:ou|a)\s*tres\s*fiadas", n): feats.add("fiadas_2_3")
+    if "todas as paredes" in n: feats.add("todas_paredes")
+    if "parede hidraulica" in n: feats.add("parede_hidraulica")
+    if "box" in n and "parede" in n: feats.add("zona_box")
+    if "lateral do shaft" in n or "parede do lavatorio" in n or "parede da bacia" in n: feats.add("zonas_especificas")
+    return feats
+
+
+def conflito_geometria_revestimento(found, expected):
+    f, e = caracteristicas_revestimento(found), caracteristicas_revestimento(expected)
+    if not f or not e:
+        return None
+    # Piso-teto é diferente de meia altura / fiadas.
+    meia = {"altura_150", "acima_bancada", "fiadas_2_3"}
+    if ("piso_teto" in e and f & meia) or ("piso_teto" in f and e & meia):
+        return "Extensão do revestimento divergente (piso ao teto x revestimento parcial/acima da bancada)."
+    # Todas as paredes é mais abrangente que parede hidráulica / zonas específicas.
+    restr = {"parede_hidraulica", "zona_box", "zonas_especificas"}
+    if ("todas_paredes" in e and f & restr) or ("todas_paredes" in f and e & restr):
+        return "Área de aplicação do revestimento divergente (todas as paredes x paredes/zonas específicas)."
+    return None
+
+
+def similaridade(a, b):
+    na, nb = normalizar(a), normalizar(b)
+    if not na or not nb:
+        return 0.0
+    ta, tb = tokens(na), tokens(nb)
+    jac = len(ta & tb) / max(1, len(ta | tb))
+    cov = len(ta & tb) / max(1, min(len(ta), len(tb)))
+    seq = SequenceMatcher(None, na[:1400], nb[:1400]).ratio()
+    return 0.40 * jac + 0.35 * cov + 0.25 * seq
+
+
+def avaliar(found, expected, item_canon):
+    nf, ne = normalizar(found), normalizar(expected)
+    if not nf:
+        return STATUS_INFO, "Trecho não localizado com segurança.", 0.0
+    # Trata como "não aplicável" somente quando isso é a essência da célula.
+    # Evita o bug de células como "Granito ... *ADM - não aplicável" serem lidas como N/A.
+    mats_ne = materiais(ne)
+    esperado_na_puro = ("nao aplicavel" in ne and not mats_ne and len(ne) <= 180)
+    if esperado_na_puro:
+        equivalentes_na = ["nao aplicavel", "sem rodape", "sem soleira", "sem baguete", "sem tento", "sem peitoril", "sem janela", "sem janelas"]
+        if any(x in nf for x in equivalentes_na) or nf.strip() in {"0", "0.", "zero"}:
+            return STATUS_OK, "Memorial e R96 indicam ausência/não aplicabilidade equivalente.", 1.0
+        return STATUS_INFO, "R96 indica não aplicável/condicional; o trecho requer confirmação de aplicabilidade.", 0.35
+
+    # Para parede/revestimento, conflitos de extensão são avaliados ANTES de material/similaridade.
+    if item_canon == "parede":
+        cg = conflito_geometria_revestimento(nf, ne)
+        if cg:
+            return STATUS_ERRO, cg, 0.96
+
+    mf, me = materiais(nf), materiais(ne)
+    # materiais explícitos e incompatíveis => divergência objetiva
+    if mf and me and mf.isdisjoint(me):
+        return STATUS_ERRO, f"Material/solução divergente: memorial indica {', '.join(sorted(mf))}; R96 prevê {', '.join(sorted(me))}.", 0.95
+
+    sim = similaridade(nf, ne)
+    # Exato / contido
+    if ne in nf or nf in ne:
+        return STATUS_OK, "Descrição compatível com o R96.", 1.0
+    # Se o memorial escolhe uma alternativa material prevista e não há conflito geométrico,
+    # considera compatível mesmo quando o R96 traz uma observação longa/condicional.
+    if mf and me and mf <= me and sim >= 0.18:
+        return STATUS_OK, "Material/solução encontrada está entre as alternativas previstas no R96.", max(0.72, sim)
+
+    # Confere também o núcleo da primeira oração (útil quando o R96 acrescenta observações).
+    ff = re.split(r"[.;]", nf)[0].strip()
+    ee = re.split(r"[.;]", ne)[0].strip()
+    tf, te = tokens(ff), tokens(ee)
+    nucleo = len(tf & te) / max(1, min(len(tf), len(te))) if tf and te else 0.0
+    if nucleo >= 0.72 and not conflito_geometria_revestimento(nf, ne):
+        return STATUS_OK, "Núcleo técnico da descrição compatível com o R96.", max(sim, nucleo)
+
+    # Exige similaridade técnica razoável — não basta compartilhar apenas o nome do material.
+    if sim >= 0.56:
+        return STATUS_OK, "Descrição tecnicamente compatível com o R96.", sim
+    return STATUS_INFO, "Não foi possível concluir a equivalência técnica com segurança.", sim
+
+
+def regras_para(base, padrao, escopo):
+    if escopo == "Área Comum":
+        return base[base["escopo"] == "Área Comum"].copy()
+    return base[(base["escopo"] == "Área Privativa") & (base["padrao"] == padrao)].copy()
+
+
+
+def padrao_para_registro(registro, padrao_predominante, excecoes):
+    """Roteia apenas itens privativos quando o próprio trecho identifica uma exceção.
+    Se não houver evidência do grupo, mantém o padrão predominante.
+    """
+    if registro.get("escopo") != "Área Privativa" or not excecoes:
+        return padrao_predominante
+    txt = normalizar(f"{registro.get('ambiente_doc','')} {registro.get('valor','')}")
+    melhor = (0.0, padrao_predominante)
+    for ex in excecoes:
+        aplic = normalizar(ex.get("aplicacao", ""))
+        if not aplic:
+            continue
+        score = 0.0
+        # Torres explicitadas
+        for torre in re.findall(r"torre\s+([a-z0-9]+)", aplic):
+            if re.search(rf"torre\s+{re.escape(torre)}\b", txt):
+                score += 2.0
+        # Finais / unidades explicitados
+        nums = re.findall(r"\b\d{1,3}\b", aplic)
+        if nums:
+            acertos = 0
+            for num in nums:
+                try:
+                    if re.search(rf"\b0*{int(num)}\b", txt):
+                        acertos += 1
+                except Exception:
+                    pass
+            score += 0.45 * acertos
+        # Tipologias / termos textuais relevantes
+        for termo in ["pcd", "pne", "studio", "apa"]:
+            if termo in aplic and termo in txt:
+                score += 1.0
+        if score > melhor[0]:
+            melhor = (score, ex.get("padrao", padrao_predominante))
+    return melhor[1] if melhor[0] >= 1.0 else padrao_predominante
+
+def auditar_registros(registros, base, padrao, grupo="Regra geral", excecoes=None):
+    out = []
+    vistos = set()
+    for r in registros:
+        esc = r["escopo"]
+        padrao_item = padrao_para_registro(r, padrao, excecoes)
+        regras = regras_para(base, padrao_item, esc)
+        amb = r["ambiente_base"]
+        regra = parear_regra_item(regras[regras["ambiente"] == amb], r["item_canon"])
+        chave = (esc, amb, r["item_canon"], r["page"], normalizar(r["valor"])[:160])
+        if chave in vistos:
+            continue
+        vistos.add(chave)
         if regra is None:
-            # Existe um item real no memorial, mas não há item equivalente na matriz para esse ambiente.
-            resultados.append({
-                "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
-                "Área": escopo, "Ambiente": ent["ambiente_base"], "Seção": "MAPEAMENTO",
-                "Item": ent["item_canon"], "Texto encontrado": ent["valor"],
-                "Especificação prevista": "Item sem correspondência na matriz R96 para este ambiente",
+            out.append({
+                "Grupo / Aplicação": grupo, "Padrão aplicado": padrao_item, "Área": esc,
+                "Ambiente": amb, "Seção": "MAPEAMENTO", "Item": r["rotulo"],
+                "Texto encontrado": r["valor"], "Especificação prevista": "Sem item equivalente no R96 para este ambiente",
                 "Status": STATUS_INFO, "Orientação / resposta prevista": "Sem ação automática.",
-                "Observação": "Item encontrado no memorial, porém sem linha equivalente no R96.",
-                "Confiança": round(float(ent["score_ambiente"]), 2),
-                "Fonte": "Padrão de Acabamentos R96",
+                "Observação": "O item foi localizado no memorial, mas não existe correspondência segura no R96.",
+                "Confiança": round(r["score_ambiente"], 2), "Fonte": "Padrão de Acabamentos R96",
+                "Página": r["page"], "BBox": r["bbox"],
             })
             continue
-
-        status, obs, conf_txt = avaliar_regra_v4(ent["valor"], regra)
-        conf = min(float(ent["score_ambiente"]), max(float(conf_txt), 0.01))
-        orient = "Nenhuma ação necessária." if status == STATUS_OK else (regra["especificacao"] if status == STATUS_ERRO else "Sem ação automática - comparação inconclusiva.")
-        resultados.append({
-            "Grupo / Aplicação": grupo_nome, "Padrão aplicado": padrao_tecnico,
-            "Área": escopo, "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
-            "Texto encontrado": ent["valor"], "Especificação prevista": regra["especificacao"], "Status": status,
-            "Orientação / resposta prevista": orient, "Observação": obs,
-            "Confiança": round(conf, 2), "Fonte": regra["fonte"],
+        stt, obs, conf = avaliar(r["valor"], regra["especificacao"], r["item_canon"])
+        orient = "Nenhuma ação necessária." if stt == STATUS_OK else (regra["especificacao"] if stt == STATUS_ERRO else "Comparação inconclusiva; revisar apenas se necessário.")
+        out.append({
+            "Grupo / Aplicação": grupo, "Padrão aplicado": padrao_item, "Área": esc,
+            "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
+            "Texto encontrado": r["valor"], "Especificação prevista": regra["especificacao"],
+            "Status": stt, "Orientação / resposta prevista": orient, "Observação": obs,
+            "Confiança": round(min(r["score_ambiente"], max(conf, 0.01)), 2), "Fonte": regra["fonte"],
+            "Página": r["page"], "BBox": r["bbox"],
         })
-    return resultados
-
-
-def auditar_base_r96_v4(texto, base, padrao_predominante, excecoes=None):
-    resultados = []
-    # V6: o documento dirige a auditoria. Não cria uma linha para cada célula do R96.
-    for escopo in ["Área Privativa", "Área Comum"]:
-        texto_escopo = recortar_texto_por_escopo(texto, escopo)
-        resultados.extend(auditar_conjunto_r96(texto_escopo, base, padrao_predominante, escopo, "Regra geral"))
-
-    # Exceções continuam sendo uma segunda passagem privativa, restrita ao grupo informado.
-    nt = normalizar(texto)
-    for ex in excecoes or []:
-        aplic = ex.get("aplicacao", "").strip()
-        if not aplic: continue
-        termos = [t.strip() for t in re.split(r"[-–—,:]", aplic) if len(t.strip()) >= 3]
-        pos = next((nt.find(normalizar(t)) for t in termos if normalizar(t) and nt.find(normalizar(t)) >= 0), -1)
-        if pos < 0: continue
-        recorte = nt[max(0, pos-400):min(len(nt), pos+9000)]
-        resultados.extend(auditar_conjunto_r96(recorte, base, ex["padrao"], "Área Privativa", aplic))
-    return resultados
-
+    return out
 
 # ==============================================================================
-# CAMADAS COMPLEMENTARES DOS PROTOCOLOS
+# Protocolo / Especificações Gerais
 # ==============================================================================
+def localizar_gatilho_pdf(file_bytes, gatilhos):
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        for pno, page in enumerate(doc, start=1):
+            txt = normalizar(page.get_text("text"))
+            for g in gatilhos:
+                ng = normalizar(g)
+                if ng and ng in txt:
+                    rects = page.search_for(g)
+                    return pno, (_bbox_union(rects[:1]) if rects else None), g
+    except Exception:
+        pass
+    return None, None, ""
 
-def auditoria_especificacoes_gerais_cliente(texto, padrao, grupos_mistos):
-    """Checklist humano já definido para Especificações Gerais do Memorial Cliente."""
-    resultados = []
+
+def auditoria_gerais_cliente(file_bytes, padrao):
     regras = [
-        ("Estrutura e Vedações", "Confirmar no projeto estrutural o sistema construtivo adotado."),
-        ("Antena coletiva / TV por assinatura", "Confirmar em projeto as quantidades de pontos de TV a serem previstas."),
-        ("Sistema de Telefonia", "Confirmar em projeto as quantidades de pontos de telefonia a serem previstas."),
-        ("Elevadores", "Confirmar em projeto as quantidades de elevadores e de 'transfer' previstas."),
-        ("Pressurização", "Confirmar se o projeto possui escada pressurizada ou ventilada."),
-        ("Instalações Hidráulicas", "Confirmar diferenças entre grupos de unidades quanto a água quente, aquecimento a gás e/ou chuveiro elétrico."),
+        ("Estrutura e Vedações", ["estrutura e vedacoes", "estrutura e vedações"], "Confirmar no projeto estrutural o sistema construtivo adotado."),
+        ("Antena coletiva / TV por assinatura", ["antena coletiva", "tv por assinatura"], "Confirmar em projeto as quantidades de pontos de TV a serem previstas."),
+        ("Sistema de Telefonia", ["sistema de telefonia", "telefonia"], "Confirmar em projeto as quantidades de pontos de telefonia a serem previstas."),
+        ("Elevadores", ["elevadores"], "Confirmar em projeto as quantidades de elevadores e de 'transfer' previstas."),
+        ("Pressurização", ["pressurizacao", "pressurização"], "Confirmar se o projeto possui escada pressurizada ou ventilada."),
+        ("Instalações Hidráulicas", ["instalacoes hidraulicas", "instalações hidráulicas"], "Confirmar diferenças entre grupos de unidades quanto a água quente, aquecimento a gás e/ou chuveiro elétrico."),
     ]
-    for item, orient in regras:
-        resultados.append({
-            "Grupo / Aplicação": "Geral",
-            "Padrão aplicado": padrao,
-            "Área": "Especificações Gerais",
-            "Ambiente": "Geral",
-            "Seção": "ESPECIFICAÇÕES GERAIS",
-            "Item": item,
-            "Texto encontrado": "Verificação pontual / confirmação em projeto",
-            "Especificação prevista": orient,
-            "Status": STATUS_ATENCAO,
-            "Orientação / resposta prevista": orient,
-            "Observação": "Item dependente de confirmação do coordenador/projeto.",
-            "Confiança": 1.0,
-            "Fonte": "Protocolo Memorial do Cliente",
-        })
-
-    # Regras condicionais para Médio ou Misto contendo Médio
-    tem_medio = padrao == "Médio" or (padrao == "Misto" and any(g.get("padrao") == "Médio" for g in grupos_mistos or []))
-    if tem_medio:
-        aplicacao = "Somente grupos/unidades de padrão Médio" if padrao == "Misto" else "Unidades padrão Médio"
-        for item in ["Máquina de lavar louças", "Previsão de ar-condicionado"]:
-            resultados.append({
-                "Grupo / Aplicação": aplicacao,
-                "Padrão aplicado": "Médio",
-                "Área": "Especificações Gerais",
-                "Ambiente": "Unidades",
-                "Seção": "OBSERVAÇÕES GERAIS",
-                "Item": item,
-                "Texto encontrado": "Conferir atribuição no memorial",
-                "Especificação prevista": f"O item deve ser atribuído apenas às unidades/grupos Médio ({aplicacao}).",
-                "Status": STATUS_ATENCAO,
-                "Orientação / resposta prevista": f"Confirmar que {item.lower()} aparece somente para as unidades de padrão Médio.",
-                "Observação": "Em empreendimento misto, não generalizar este diferencial para unidades Econômico/Super Econômico.",
-                "Confiança": 1.0,
-                "Fonte": "Protocolo Memorial do Cliente",
-            })
-    return resultados
-
-
-def auditoria_protocolo_cef(texto):
-    nt = normalizar(texto)
-    resultados = []
-    for regra in PROTOCOLO_CEF:
-        if not any(normalizar(g) in nt for g in regra["gatilhos"]):
+    out = []
+    for item, gat, orient in regras:
+        pg, bb, achado = localizar_gatilho_pdf(file_bytes, gat)
+        if not pg:
             continue
-        status = STATUS_ATENCAO if regra["acao"] == "atencao" else STATUS_INFO
-        resultados.append({
-            "Grupo / Aplicação": "Geral / CEF",
-            "Padrão aplicado": "Conforme configuração do empreendimento",
-            "Área": "Protocolo Financiador",
-            "Ambiente": "Geral",
-            "Seção": "ORIENTAÇÕES DA COORDENAÇÃO",
-            "Item": regra["titulo"],
-            "Texto encontrado": "Item/gatilho localizado no Memorial CEF",
-            "Especificação prevista": regra["orientacao"],
-            "Status": status,
-            "Orientação / resposta prevista": regra["orientacao"],
-            "Observação": "Camada adicional do protocolo CEF; não substitui a conferência técnica pela base R96.",
-            "Confiança": 1.0,
-            "Fonte": regra["fonte"],
+        out.append({
+            "Grupo / Aplicação":"Geral", "Padrão aplicado":padrao, "Área":"Especificações Gerais", "Ambiente":"Geral",
+            "Seção":"ESPECIFICAÇÕES GERAIS", "Item":item,
+            "Texto encontrado": f"Trecho localizado: {achado}", "Especificação prevista":orient,
+            "Status":STATUS_ATENCAO, "Orientação / resposta prevista":orient,
+            "Observação":"Item dependente de confirmação do coordenador/projeto.", "Confiança":1.0,
+            "Fonte":"Protocolo Memorial do Cliente", "Página":pg, "BBox":bb,
         })
-    return resultados
+    return out
 
 
-def auditar_memorial(texto, base, padrao, tipo_doc, excecoes=None, incluir_gerais_cliente=True):
-    resultados = auditar_base_r96_v4(texto, base, padrao, excecoes)
-
-    if tipo_doc == "Memorial do Cliente (Comercial / Vendas)" and incluir_gerais_cliente:
-        resultados.extend(auditoria_especificacoes_gerais_cliente(texto, padrao, []))
-    if tipo_doc == "Memorial CEF / Financiador":
-        resultados.extend(auditoria_protocolo_cef(texto))
-
-    cols = ["Grupo / Aplicação", "Padrão aplicado", "Área", "Ambiente", "Seção", "Item",
-            "Texto encontrado", "Especificação prevista", "Status", "Orientação / resposta prevista",
-            "Observação", "Confiança", "Fonte"]
-    return pd.DataFrame(resultados, columns=cols) if resultados else pd.DataFrame(columns=cols)
+def auditoria_cef_protocolo(file_bytes, padrao):
+    out = []
+    for item, gat, orient, fonte in PROTOCOLO_CEF:
+        pg, bb, achado = localizar_gatilho_pdf(file_bytes, gat)
+        if not pg:
+            continue
+        out.append({
+            "Grupo / Aplicação":"Geral / CEF", "Padrão aplicado":padrao, "Área":"Protocolo Financiador", "Ambiente":"Geral",
+            "Seção":"ORIENTAÇÕES DA COORDENAÇÃO", "Item":item,
+            "Texto encontrado":f"Trecho localizado: {achado}", "Especificação prevista":orient,
+            "Status":STATUS_ATENCAO, "Orientação / resposta prevista":orient,
+            "Observação":"Alerta adicional do protocolo CEF; não substitui a conferência do R96.", "Confiança":1.0,
+            "Fonte":fonte, "Página":pg, "BBox":bb,
+        })
+    return out
 
 # ==============================================================================
-# DOCUMENTOS ANOTADOS
+# Recorte / PDF revisado
 # ==============================================================================
+def recorte_ocorrencia_pdf(file_bytes, pagina, bbox=None, zoom=1.7):
+    pg = pagina_int(pagina)
+    if not pg:
+        return None
+    try:
+        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        if pg > len(doc): return None
+        page = doc[pg-1]
+        if bbox and isinstance(bbox, (list, tuple)) and len(bbox) == 4:
+            r = fitz.Rect(*bbox)
+            clip = fitz.Rect(max(0, r.x0-80), max(0, r.y0-95), min(page.rect.width, r.x1+420), min(page.rect.height, r.y1+160))
+        else:
+            clip = page.rect
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), clip=clip, alpha=False)
+        return pix.tobytes("png")
+    except Exception:
+        return None
+
 
 def _texto_caixa(row):
+    trecho = str(row.get("Texto encontrado", "")).replace("\n", " ")[:145]
     if row["Status"] == STATUS_ERRO:
-        return (f"DIVERGÊNCIA — {row['Ambiente']} / {row['Item']}\n"
-                f"Encontrado: {str(row['Texto encontrado'])[:180]}\n"
-                f"Corrigir para: {str(row['Especificação prevista'])[:220]}")
-    return (f"ATENÇÃO — {row['Item']}\n"
-            f"Confirmar: {str(row['Orientação / resposta prevista'])[:320]}")
+        prev = str(row.get("Especificação prevista", "")).replace("\n", " ")[:175]
+        return f"DIVERGÊNCIA · {row['Ambiente']} / {row['Item']}\nTrecho: {trecho}\nCorrigir: {prev}"
+    return f"ATENÇÃO · {row['Item']}\nTrecho: {trecho}\nConfirmar: {str(row.get('Orientação / resposta prevista',''))[:185]}"
 
 
 def gerar_pdf_anotado(file_bytes, df):
-    """Cria PDF revisado com o memorial INTACTO à esquerda e faixa MIA à direita.
-    Nenhuma caixa cobre o documento original.
-    """
     src = fitz.open(stream=file_bytes, filetype="pdf")
     out = fitz.open()
     painel = 250
-
-    # Agrupa ocorrências por página previamente calculada; sem página vai para a primeira.
     por_pg = {}
     for _, row in df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])].iterrows():
-        pg = row.get("Página", None)
-        try:
-            pg = int(pg) if pg and not pd.isna(pg) else 1
-        except Exception:
-            pg = 1
-        por_pg.setdefault(max(1, min(pg, len(src))), []).append(row)
-
+        pg = pagina_int(row.get("Página"))
+        if pg:
+            por_pg.setdefault(pg, []).append(row)
     for pno, sp in enumerate(src, start=1):
         op = out.new_page(width=sp.rect.width + painel, height=sp.rect.height)
-        op.show_pdf_page(fitz.Rect(0, 0, sp.rect.width, sp.rect.height), src, pno - 1)
-        op.draw_line((sp.rect.width, 0), (sp.rect.width, sp.rect.height), color=(0.82,0.82,0.82), width=0.7)
-        op.insert_text((sp.rect.width + 16, 24), "MIA · REVISÃO", fontsize=9, fontname="helv", color=(0.25,0.25,0.25))
-        y = 42
-        for row in por_pg.get(pno, []):
+        op.show_pdf_page(fitz.Rect(0,0,sp.rect.width,sp.rect.height), src, pno-1)
+        op.draw_line((sp.rect.width,0),(sp.rect.width,sp.rect.height), color=(0.84,0.84,0.84), width=0.6)
+        if pno not in por_pg:
+            continue
+        op.insert_text((sp.rect.width+12,18), "MIA · REVISÃO", fontsize=7.5, fontname="helv", color=(0.30,0.30,0.30))
+        y = 28
+        for row in por_pg[pno]:
             texto = _texto_caixa(row)
             iserr = row["Status"] == STATUS_ERRO
-            fill = (1.0,0.94,0.94) if iserr else (1.0,0.97,0.83)
+            fill = (1.0,0.94,0.94) if iserr else (1.0,0.98,0.86)
             stroke = (0.80,0.12,0.12) if iserr else (0.62,0.43,0.0)
-            h = 108 if iserr else 88
-            if y + h > sp.rect.height - 18:
-                # Não sobrepõe: interrompe e registra continuação compacta no rodapé.
-                op.insert_text((sp.rect.width + 16, sp.rect.height - 16), "Demais apontamentos: consultar a tela/relatório MIA.", fontsize=6.5, fontname="helv", color=(0.35,0.35,0.35))
+            # altura dinâmica e compacta
+            chars = max(1, len(texto))
+            h = min(118, max(54, 42 + 9 * (chars // 70)))
+            if y + h > sp.rect.height - 10:
                 break
-            box = fitz.Rect(sp.rect.width + 12, y, sp.rect.width + painel - 12, y + h)
-            op.draw_rect(box, color=stroke, fill=fill, width=0.8)
-            op.insert_textbox(box + (8,8,-8,-8), texto, fontsize=7.1, fontname="helv", color=(0.10,0.10,0.10), lineheight=1.12)
-            # linha de referência quando houver bbox
-            bb = row.get("BBox", None)
-            if isinstance(bb, (tuple, list)) and len(bb) == 4:
+            box = fitz.Rect(sp.rect.width+10, y, sp.rect.width+painel-10, y+h)
+            op.draw_rect(box, color=stroke, fill=fill, width=0.7)
+            op.insert_textbox(box + (7,6,-7,-6), texto, fontsize=6.6, fontname="helv", color=(0.08,0.08,0.08), lineheight=1.08)
+            bb = row.get("BBox")
+            if isinstance(bb,(tuple,list)) and len(bb)==4:
                 try:
                     rr = fitz.Rect(*bb)
-                    yy = min(max(rr.y0 + rr.height/2, 10), sp.rect.height-10)
-                    op.draw_line((rr.x1 + 4, yy), (sp.rect.width + 12, y + 15), color=stroke, width=0.6)
+                    yy = min(max(rr.y0 + rr.height/2, 8), sp.rect.height-8)
+                    op.draw_line((rr.x1+3,yy),(sp.rect.width+10,y+12), color=stroke, width=0.5)
                 except Exception:
                     pass
-            y += h + 10
-
+            y += h + 6
     return out.tobytes(garbage=3, deflate=True)
 
 
 def gerar_docx_anotado(file_bytes, df):
     doc = docx.Document(io.BytesIO(file_bytes))
-    p = doc.add_paragraph(); r = p.add_run("--- MIA | AUDITORIA ---"); r.font.bold = True
-    pendencias = df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])]
-    for _, row in pendencias.head(100).iterrows():
+    p = doc.add_paragraph(); p.add_run("--- MIA | AUDITORIA ---").bold = True
+    for _, row in df[df["Status"].isin([STATUS_ERRO, STATUS_ATENCAO])].head(100).iterrows():
         p = doc.add_paragraph(); r = p.add_run(_texto_caixa(row))
         r.font.highlight_color = WD_COLOR_INDEX.RED if row["Status"] == STATUS_ERRO else WD_COLOR_INDEX.YELLOW
-    output = io.BytesIO(); doc.save(output); output.seek(0); return output
+    out = io.BytesIO(); doc.save(out); return out.getvalue()
 
 # ==============================================================================
-# INTERFACE
+# Empreendimento com exceções de padrão
 # ==============================================================================
-
 def configurar_excecoes_sidebar():
     st.sidebar.markdown("### Padrões diferentes (opcional)")
     possui = st.sidebar.checkbox("O empreendimento possui unidades com padrão diferente?", value=False)
     if not possui:
         return []
     qtd = st.sidebar.number_input("Quantidade de exceções", min_value=1, max_value=12, value=1, step=1)
-    excecoes = []
+    out = []
     for i in range(int(qtd)):
         with st.sidebar.expander(f"Exceção {i+1}", expanded=True):
-            aplicacao = st.text_input("Aplicação", placeholder="Ex.: Torre C - finais 01, 02, 05 e 06", key=f"aplic_{i}")
+            aplic = st.text_input("Aplicação", placeholder="Ex.: Torre C - finais 01, 02, 05 e 06", key=f"aplic_{i}")
             pad = st.selectbox("Padrão técnico", PADROES_TECNICOS, index=2, key=f"pad_ex_{i}")
-            if aplicacao.strip(): excecoes.append({"aplicacao": aplicacao.strip(), "padrao": pad})
-    return excecoes
+            if aplic.strip(): out.append({"aplicacao":aplic.strip(), "padrao":pad})
+    return out
 
-
+# ==============================================================================
+# Main
+# ==============================================================================
 def main():
     st.set_page_config(page_title="MIA | Memoriais", page_icon="M", layout="wide")
     st.title("MIA")
@@ -1030,99 +911,101 @@ def main():
         padrao = st.selectbox("Padrão predominante do empreendimento", PADROES_TECNICOS, index=1)
     excecoes = configurar_excecoes_sidebar()
     with st.sidebar:
-        if tipo_doc.startswith("Memorial do Cliente"):
-            incluir_gerais_cliente = st.checkbox("Incluir checklist de Especificações Gerais", value=True)
-        else:
-            incluir_gerais_cliente = False
+        incluir_gerais = st.checkbox("Incluir checklist de Especificações Gerais", value=True) if tipo_doc.startswith("Memorial do Cliente") else False
         st.markdown("---")
-        st.caption("Base técnica R96 carregada automaticamente pelo sistema.")
-        memorial = st.file_uploader("Memorial para análise (PDF ou DOCX)", type=["pdf", "docx"], key="memorial")
+        st.caption("Base técnica R96 carregada automaticamente.")
+        memorial = st.file_uploader("Memorial para análise (PDF ou DOCX)", type=["pdf","docx"])
 
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Tipo", "Cliente" if tipo_doc.startswith("Memorial do Cliente") else "Financiador / CEF")
-    c2.metric("Padrão predominante", padrao)
-    c3.metric("Exceções", len(excecoes))
+    a,b,c = st.columns(3)
+    a.metric("Tipo", "Cliente" if tipo_doc.startswith("Memorial do Cliente") else "Financiador / CEF")
+    b.metric("Padrão predominante", padrao)
+    c.metric("Exceções", len(excecoes))
 
     if memorial is None:
-        st.info("Envie um memorial. A MIA verificará automaticamente Área Privativa e Área Comum contra a base R96.")
+        st.info("Envie um memorial para iniciar a conferência.")
         return
 
     if st.button("Executar conferência", type="primary", use_container_width=True):
-        with st.spinner("Analisando memorial e cruzando com a base R96..."):
+        with st.spinner("Lendo estrutura do memorial e cruzando Área > Ambiente > Item com o R96..."):
             try:
-                base = carregar_base_r96(None)
-            except Exception as e:
-                st.error(f"Não foi possível carregar a base R96 do repositório: {e}"); return
-            file_bytes = memorial.getvalue(); ext = memorial.name.rsplit(".",1)[-1].lower()
-            try:
-                partes = extrair_texto_pdf(file_bytes) if ext == "pdf" else extrair_texto_docx(file_bytes)
-                texto = "\n".join(p["texto"] for p in partes)
-            except Exception as e:
-                st.error(f"Erro ao ler o memorial: {e}"); return
-            if not texto.strip(): st.error("O memorial não contém texto pesquisável suficiente."); return
-            df = auditar_memorial(texto, base, padrao, tipo_doc, excecoes, incluir_gerais_cliente)
-            if ext == "pdf" and not df.empty:
-                paginas_loc, bboxes = [], []
-                for _, rr in df.iterrows():
-                    if rr["Status"] in [STATUS_ERRO, STATUS_ATENCAO] and rr["Área"] not in ["Especificações Gerais", "Protocolo Financiador"]:
-                        pg, bb = localizar_no_pdf(file_bytes, str(rr["Ambiente"]), str(rr["Item"]), str(rr["Texto encontrado"]))
+                base = carregar_base_r96()
+                file_bytes = memorial.getvalue()
+                ext = memorial.name.rsplit(".",1)[-1].lower()
+                if ext == "pdf":
+                    if tipo_doc.startswith("Memorial do Cliente"):
+                        regs = extrair_cliente_pdf(file_bytes, base, padrao)
                     else:
-                        pg, bb = (None, None)
-                    paginas_loc.append(pg); bboxes.append(bb)
-                df["Página"] = paginas_loc; df["BBox"] = bboxes
-            st.session_state.update(resultado_memorial=df, memorial_bytes=file_bytes, memorial_ext=ext, memorial_nome=memorial.name)
+                        regs = extrair_cef_pdf(file_bytes, base, padrao)
+                    resultados = auditar_registros(regs, base, padrao, excecoes=excecoes)
+                    if tipo_doc.startswith("Memorial do Cliente") and incluir_gerais:
+                        resultados += auditoria_gerais_cliente(file_bytes, padrao)
+                    if tipo_doc == "Memorial CEF / Financiador":
+                        resultados += auditoria_cef_protocolo(file_bytes, padrao)
+                else:
+                    # DOCX: mantém suporte básico; PDF é o fluxo com evidência visual precisa.
+                    doc = docx.Document(io.BytesIO(file_bytes))
+                    texto = "\n".join(p.text for p in doc.paragraphs if p.text.strip())
+                    st.warning("Para o pareamento visual completo e recortes, prefira PDF. DOCX está em modo de compatibilidade básica.")
+                    resultados = []
+                cols = ["Grupo / Aplicação","Padrão aplicado","Área","Ambiente","Seção","Item","Texto encontrado","Especificação prevista","Status","Orientação / resposta prevista","Observação","Confiança","Fonte","Página","BBox"]
+                df = pd.DataFrame(resultados, columns=cols) if resultados else pd.DataFrame(columns=cols)
+                st.session_state.update(resultado_memorial=df, memorial_bytes=file_bytes, memorial_ext=ext, memorial_nome=memorial.name)
+            except Exception as e:
+                st.exception(e)
+                return
 
     df = st.session_state.get("resultado_memorial")
-    if df is None: return
-    st.markdown("---"); st.subheader("Resultado da conferência")
-    nerr=int((df["Status"]==STATUS_ERRO).sum()); natt=int((df["Status"]==STATUS_ATENCAO).sum()); ninfo=int((df["Status"]==STATUS_INFO).sum()); nok=int((df["Status"]==STATUS_OK).sum())
-    a,b,c,d=st.columns(4); a.metric("Divergências",nerr); b.metric("Atenções",natt); c.metric("Não verificados",ninfo); d.metric("Conformes",nok)
-    st.caption(f"Mapeamento V6: {len(df)} itens efetivamente encontrados/protocolados. Itens do R96 que não aparecem no memorial não entram como 'não verificados'.")
+    if df is None:
+        return
 
-    modo = st.radio("Exibir", ["Itens que exigem ação", "Não verificados", "Conformes", "Todos"], horizontal=True)
+    st.markdown("---")
+    st.subheader("Resultado da conferência")
+    nerr=int((df["Status"]==STATUS_ERRO).sum()); natt=int((df["Status"]==STATUS_ATENCAO).sum()); ninfo=int((df["Status"]==STATUS_INFO).sum()); nok=int((df["Status"]==STATUS_OK).sum())
+    c1,c2,c3,c4=st.columns(4)
+    c1.metric("Divergências",nerr); c2.metric("Atenções",natt); c3.metric("Não verificados",ninfo); c4.metric("Conformes",nok)
+    st.caption(f"V7: {len(df)} itens localizados no próprio memorial. A classificação de Área é mantida pelo documento; ambiente sem vínculo seguro com o R96 não é forçado.")
+
+    modo=st.radio("Exibir",["Itens que exigem ação","Não verificados","Conformes","Todos"],horizontal=True)
     if modo=="Itens que exigem ação": vis=df[df["Status"].isin([STATUS_ERRO,STATUS_ATENCAO])]
     elif modo=="Não verificados": vis=df[df["Status"]==STATUS_INFO]
     elif modo=="Conformes": vis=df[df["Status"]==STATUS_OK]
     else: vis=df
 
-    if vis.empty: st.success("Nenhum item nesta categoria.")
+    if vis.empty:
+        st.success("Nenhum item nesta categoria.")
     else:
-        for idx,row in vis.head(150).iterrows():
+        for _, row in vis.head(180).iterrows():
             titulo=f"{row['Status']}  {row['Ambiente']} - {row['Item']}"
             with st.expander(titulo, expanded=row["Status"] in [STATUS_ERRO,STATUS_ATENCAO]):
                 st.markdown(f"**Área:** {row['Área']}  |  **Padrão:** {row['Padrão aplicado']}")
-                if row["Status"]==STATUS_ERRO:
-                    if st.session_state.get("memorial_ext") == "pdf" and row.get("Página", None):
-                        img = recorte_ocorrencia_pdf(st.session_state["memorial_bytes"], int(row["Página"]), row.get("BBox", None))
-                        if img:
-                            st.caption(f"Trecho do memorial · página {int(row['Página'])}")
-                            st.image(img, use_container_width=False, width=760)
-                    st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
-                    st.markdown(f"**Previsto:** {row['Especificação prevista']}")
+                pg = pagina_int(row.get("Página"))
+                if st.session_state.get("memorial_ext") == "pdf" and pg:
+                    img = recorte_ocorrencia_pdf(st.session_state["memorial_bytes"], pg, row.get("BBox"))
+                    if img:
+                        st.caption(f"Trecho do memorial · página {pg}")
+                        st.image(img, width=760)
+                st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
+                st.markdown(f"**Previsto:** {row['Especificação prevista']}")
+                if row["Status"] == STATUS_ERRO:
                     st.markdown(f"**O que corrigir:** {row['Orientação / resposta prevista']}")
-                elif row["Status"]==STATUS_ATENCAO:
-                    if st.session_state.get("memorial_ext") == "pdf" and row.get("Página", None):
-                        img = recorte_ocorrencia_pdf(st.session_state["memorial_bytes"], int(row["Página"]), row.get("BBox", None))
-                        if img:
-                            st.caption(f"Trecho do memorial · página {int(row['Página'])}")
-                            st.image(img, use_container_width=False, width=760)
+                elif row["Status"] == STATUS_ATENCAO:
                     st.markdown(f"**O que confirmar:** {row['Orientação / resposta prevista']}")
-                else:
-                    st.markdown(f"**Encontrado:** {row['Texto encontrado']}")
-                    st.markdown(f"**Previsto:** {row['Especificação prevista']}")
+                elif row["Status"] == STATUS_OK:
+                    st.markdown("**Resultado:** descrição compatível com a base.")
                 st.caption(row["Fonte"])
 
     st.markdown("### Exportações")
-    col1,col2=st.columns(2)
     xbio=io.BytesIO()
-    with pd.ExcelWriter(xbio, engine="openpyxl") as wr: df.to_excel(wr,index=False,sheet_name="Auditoria")
-    col1.download_button("Baixar relatório Excel", xbio.getvalue(), file_name=f"MIA_Auditoria_{Path(st.session_state['memorial_nome']).stem}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", use_container_width=True)
-    if st.session_state["memorial_ext"]=="pdf":
-        anot=gerar_pdf_anotado(st.session_state["memorial_bytes"],df)
-        col2.download_button("Baixar PDF revisado com caixas de texto", anot, file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}", mime="application/pdf", use_container_width=True)
+    with pd.ExcelWriter(xbio, engine="openpyxl") as wr:
+        df.to_excel(wr,index=False,sheet_name="Auditoria")
+    e1,e2=st.columns(2)
+    e1.download_button("Baixar relatório Excel",xbio.getvalue(),file_name=f"MIA_Auditoria_{Path(st.session_state['memorial_nome']).stem}.xlsx",mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",use_container_width=True)
+    if st.session_state.get("memorial_ext") == "pdf":
+        pdf=gerar_pdf_anotado(st.session_state["memorial_bytes"],df)
+        e2.download_button("Baixar PDF revisado com caixas de texto",pdf,file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}",mime="application/pdf",use_container_width=True)
     else:
-        anot=gerar_docx_anotado(st.session_state["memorial_bytes"],df)
-        col2.download_button("Baixar DOCX revisado", anot, file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        docx_out=gerar_docx_anotado(st.session_state["memorial_bytes"],df)
+        e2.download_button("Baixar DOCX revisado",docx_out,file_name=f"MIA_Revisado_{st.session_state['memorial_nome']}",mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",use_container_width=True)
 
 
 if __name__ == "__main__":
