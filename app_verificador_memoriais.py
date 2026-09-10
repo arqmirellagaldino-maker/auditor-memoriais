@@ -12,7 +12,7 @@ import fitz  # PyMuPDF
 from docx.enum.text import WD_COLOR_INDEX
 
 # ==============================================================================
-# MIA | MEMORIAIS — V8
+# MIA | MEMORIAIS — V9
 # Foco: associação técnica geral Área > Ambiente > Item > Subitem > R96,
 # comparação por requisitos técnicos e preservação de evidência/página.
 # ==============================================================================
@@ -67,8 +67,8 @@ ALIASES_AMBIENTES_PRIV = {
     "BANHOS": ["banheiro", "banheiros", "banho", "banhos", "wc"],
     "DORMITÓRIOS": ["dormitorio", "dormitorios", "quarto", "quartos"],
     "SALA": ["sala", "sala de jantar/estar", "sala de jantar/estar e circulacao", "sala de estar", "sala de jantar"],
-    "VARANDA COM A.S": ["varanda com a.s", "varanda com as", "varanda com area de servico"],
-    "VARANDA SEM A.S": ["varanda sem a.s", "varanda sem as", "varanda"],
+    "VARANDA COM A.S": ["varanda com a.s", "varanda com as", "varanda com area de servico", "terraco com area de servico", "terraço com área de serviço", "terraco com a.s", "terraço com a.s"],
+    "VARANDA SEM A.S": ["varanda sem a.s", "varanda sem as", "varanda", "terraco sem area de servico", "terraço sem área de serviço", "terraco", "terraço"],
     "CIRCULAÇÃO": ["circulacao"],
 }
 
@@ -138,6 +138,8 @@ def tokens(texto):
 def _limpar_cabecalho(txt):
     txt = re.sub(r"^[•▪●\-–—\s]+", "", str(txt)).strip()
     txt = re.sub(r"\s+[–—-]\s+TORRE\s+[A-Z0-9]+.*$", "", txt, flags=re.I)
+    # qualificadores de aplicação não fazem parte do nome técnico do ambiente
+    txt = re.sub(r"\s*\((?:UNIDADES?|FINAIS?|TORRES?).*?\)\s*$", "", txt, flags=re.I)
     return txt.strip(" .:-–—")
 
 
@@ -233,19 +235,16 @@ def carregar_base_r96():
 # ==============================================================================
 # Canonização e associação Ambiente / Item
 # ==============================================================================
-def canon_item(nome):
-    """Canonização V8: mantém itens tecnicamente distintos separados.
+BUILD_VERSION = "V9.0"
 
-    A V7 agrupava bancada/louça/tanque e toda esquadria em famílias amplas,
-    o que permitia comparar, por exemplo, bancada com tanque ou guarda-corpo
-    com ventilação permanente. A V8 só usa famílias combinadas como fallback.
-    """
+def canon_item(nome):
+    """Canonização V9: famílias técnicas distintas e combinações controladas."""
     n = normalizar(nome)
-    # elementos sanitários / bancadas
-    if "tanque" in n: return "tanque"
+    # itens combinados da matriz: escolhe família dominante sem apagar subitens no fallback
+    if "parede" in n and "sanca" in n: return "parede"
+    if "tanque" in n and not "bancad" in n: return "tanque"
     if "bancad" in n: return "bancada"
     if "louca" in n or "bacia" in n or "lavatorio" in n: return "louca"
-    # esquadrias e elementos correlatos
     if "guarda corpo" in n or "guarda-corpo" in n: return "guarda_corpo"
     if "portao" in n: return "portao"
     if "janela" in n: return "janela"
@@ -254,13 +253,11 @@ def canon_item(nome):
     if "esquadr" in n: return "esquadria_geral"
     if "peitoril" in n: return "peitoril"
     if any(x in n for x in ["soleira", "baguete", "tento", "meia soleira", " bit "]): return "soleira_baguete"
-    # acabamentos
     if "rodape" in n: return "rodape"
-    if "sanca" in n: return "sanca"
     if "parede" in n or "revestimento" in n: return "parede"
+    if "sanca" in n: return "sanca"
     if "teto" in n or "forro" in n: return "teto"
     if "piso" in n: return "piso"
-    # instalações
     if "metal" in n or "torneira" in n or "misturador" in n or "registro" in n: return "metais"
     if "agua fria" in n: return "agua_fria"
     if "agua quente" in n: return "agua_quente"
@@ -274,18 +271,39 @@ def canon_item(nome):
     if "gas" in n: return "gas"
     return n[:100]
 
+def canon_item_contexto(rotulo, valor):
+    """Refina rótulos genéricos usando SOMENTE o conteúdo do próprio campo."""
+    base = canon_item(rotulo)
+    nv = normalizar(valor)
+    if base == "esquadria_geral":
+        if "guarda corpo" in nv or "guarda-corpo" in nv:
+            return "guarda_corpo"
+        if re.search(r"\bporta\b", nv):
+            return "porta"
+        if re.search(r"\bjanela\b", nv):
+            return "janela"
+        if any(x in nv for x in ["ventilacao", "veneziana", "caixilho", " vp ", "vp inferior", "vp superior"]):
+            return "esquadria_especial"
+    return base
 
 def familias_item_regra(nome, especificacao=""):
-    """Retorna famílias possíveis de uma linha R96 sem fundir os itens do memorial."""
-    n = normalizar(nome)
-    e = normalizar(especificacao)
-    fam = {canon_item(nome)}
-    # Linhas combinadas do planilhão podem atender mais de um rótulo, mas somente
-    # se a própria especificação trouxer evidência daquele subitem.
-    if "bancad" in n or "louca" in n or "tanque" in n:
-        if "bancad" in e or any(x in e for x in ["granito", "marmore", "aco inox", "inox"]): fam.add("bancada")
-        if "tanque" in e: fam.add("tanque")
-        if any(x in e for x in ["louca", "bacia", "lavatorio"]): fam.add("louca")
+    """Famílias possíveis de uma linha R96 sem fundir subitens distintos."""
+    n = normalizar(nome); e = normalizar(especificacao)
+    combinado_blt = ("bancad" in n and "louca" in n) or ("bancad" in n and "tanque" in n) or ("louca" in n and "tanque" in n)
+    fam = set() if combinado_blt else {canon_item(nome)}
+    if "parede" in n and "sanca" in n:
+        fam.update({"parede", "sanca"})
+    if any(x in n for x in ["bancad", "louca", "tanque"]):
+        # Para linhas combinadas, a especificação decide o subitem.
+        if "bancada" in e or (not combinado_blt and "bancad" in n):
+            fam.add("bancada")
+        if "tanque" in e or (not combinado_blt and "tanque" in n):
+            fam.add("tanque")
+        if any(x in e for x in ["bacia", "lavatorio", "louca sanitaria"]) or (not combinado_blt and "louca" in n):
+            fam.add("louca")
+        # Quando a descrição é inequivocamente de bancada mas omite a palavra bancada.
+        if combinado_blt and not fam and any(x in e for x in ["granito com cuba", "marmore com cuba", "cuba de embutir"]):
+            fam.add("bancada")
     if "esquadr" in n:
         if any(x in e for x in ["vp", "ventilacao", "veneziana", "caixilho"]): fam.add("esquadria_especial")
         if "janela" in e: fam.add("janela")
@@ -315,33 +333,49 @@ def score_ambiente(doc_nome, base_nome, escopo):
     if not a or not b:
         return 0.0
     aliases = aliases_do_ambiente(base_nome, escopo)
-    # aliases exatos/contidos têm prioridade absoluta
     if a in aliases:
         return 1.0
-    if any(len(x) >= 5 and (a == x or a in x or x in a) for x in aliases):
-        return 0.95
+    # contenção só serve como apoio; quanto mais específico o alias, maior o peso
+    cont_scores=[]
+    for x in aliases:
+        if len(x) >= 5 and (x in a or a in x):
+            # qualificadores mudam o ambiente: "fitness externo" não é automaticamente
+            # a sala de ginástica interna só porque contém a palavra fitness.
+            if "extern" in a and "extern" not in x and a != x:
+                continue
+            coverage = min(len(x), len(a)) / max(len(x), len(a))
+            cont_scores.append(0.78 + 0.18 * coverage)
+    if cont_scores:
+        return max(cont_scores)
     ta, tb = tokens(a), tokens(b)
     inter = ta & tb
     if not inter:
-        return 0.0  # trava principal: palavras desconexas nunca são pareadas
+        return 0.0
     jac = len(inter) / max(1, len(ta | tb))
     cov = len(inter) / max(1, min(len(ta), len(tb)))
     seq = SequenceMatcher(None, a, b).ratio()
     return 0.45 * cov + 0.35 * jac + 0.20 * seq
 
-
 def parear_ambiente(doc_nome, regras, escopo):
     nomes = list(dict.fromkeys(str(x) for x in regras["ambiente"].dropna()))
     if not nomes:
         return None, 0.0
+    a = normalizar(_limpar_cabecalho(doc_nome))
+    # 1) alias exato: decisão determinística
+    exatos=[]
+    for n in nomes:
+        als=aliases_do_ambiente(n, escopo)
+        if a in als:
+            exatos.append((max(len(x) for x in als if x==a), n))
+    if exatos:
+        return sorted(exatos, reverse=True)[0][1], 1.0
+    # 2) demais casos com margem de segurança
     scored = sorted(((score_ambiente(doc_nome, n, escopo), n) for n in nomes), reverse=True)
     s1, n1 = scored[0]
     s2 = scored[1][0] if len(scored) > 1 else 0.0
-    # exige confiança alta OU alias forte; e evita empate ambíguo
-    if s1 < 0.72 or (s1 < 0.94 and s1 - s2 < 0.10):
+    if s1 < 0.80 or (s1 < 0.96 and s1 - s2 < 0.12):
         return None, s1
     return n1, s1
-
 
 def parear_regra_item(regras_amb, canon, valor_encontrado=""):
     """Escolhe a regra do MESMO subitem; similaridade textual nunca troca a família técnica."""
@@ -459,6 +493,7 @@ def extrair_cliente_pdf(file_bytes, base, padrao):
     def fechar():
         nonlocal atual
         if atual and atual["valor"].strip() and ambiente_base:
+            atual["item_canon"] = canon_item_contexto(atual.get("rotulo", ""), atual.get("valor", ""))
             resultados.append(atual)
         atual = None
 
@@ -479,7 +514,7 @@ def extrair_cliente_pdf(file_bytes, base, padrao):
             fechar()
             atual = {
                 "escopo": escopo, "ambiente_doc": ambiente_doc, "ambiente_base": ambiente_base,
-                "score_ambiente": score_amb, "item_canon": canon_item(m.group(1)),
+                "score_ambiente": score_amb, "item_canon": canon_item_contexto(m.group(1), m.group(2).strip()),
                 "rotulo": m.group(1), "valor": f"{m.group(1)}: {m.group(2).strip()}".strip(),
                 "page": ln["page"], "bbox": ln["bbox"],
             }
@@ -704,20 +739,55 @@ def materiais_nucleo(item_canon, mats):
     return mats
 
 
+def _sistemas_superficie(texto):
+    n=normalizar(texto); out=set()
+    if "gesso liso" in n: out.add("gesso_liso")
+    if "bloco aparente" in n or "blocos aparentes" in n: out.add("bloco_aparente")
+    if "caiacao" in n: out.add("caiacao")
+    if "textura acrilica" in n: out.add("textura_acrilica")
+    if "monocapa" in n: out.add("monocapa")
+    if "ceramica" in n: out.add("ceramica")
+    if "pintura" in n: out.add("pintura")
+    if "concreto aparente" in n: out.add("concreto_aparente")
+    return out
+
+
+def _segmento_principal_regra(expected, found=""):
+    """Usa o requisito padrão antes das exceções marcadas com *; só abre exceção se o trecho a invocar."""
+    txt=str(expected or "")
+    nf=normalizar(found)
+    # Se o próprio trecho identifica PCD/PNE/condição especial, mantém a regra completa.
+    if any(x in nf for x in ["pcd", "pne", "32m", "32 m", "quando aplicavel", "quando houver"]):
+        return txt
+    # notas condicionais no R96 normalmente começam por asterisco; não devem tornar
+    # automaticamente compatível uma solução que contradiz o requisito principal.
+    principal=re.split(r"\n?\s*\*+", txt, maxsplit=1)[0].strip()
+    return principal or txt
+
 def requisitos_compativeis(found, expected, item_canon):
-    af, ae = atributos_tecnicos(found, item_canon), atributos_tecnicos(expected, item_canon)
-    mf = materiais_nucleo(item_canon, af["materiais"])
-    me = materiais_nucleo(item_canon, ae["materiais"])
+    expected_cmp = _segmento_principal_regra(expected, found)
+    af, ae = atributos_tecnicos(found, item_canon), atributos_tecnicos(expected_cmp, item_canon)
+    mf = materiais_nucleo(item_canon, af["materiais"]); me = materiais_nucleo(item_canon, ae["materiais"])
+    if item_canon == "parede":
+        cg = conflito_geometria_revestimento(found, expected_cmp)
+        if cg: return False, cg
+        sf,se=_sistemas_superficie(found),_sistemas_superficie(expected_cmp)
+        fortes={"gesso_liso","bloco_aparente","caiacao","textura_acrilica","monocapa","ceramica","concreto_aparente"}
+        ff,ee=sf&fortes,se&fortes
+        if ff and ee and ff.isdisjoint(ee):
+            return False, f"Sistema/acabamento de parede divergente: memorial indica {', '.join(sorted(ff))}; R96 prevê {', '.join(sorted(ee))}."
+        if ff and ee and ff & ee:
+            return True, "Sistema principal de parede compatível; diferenças complementares de redação não alteram a conformidade."
     if mf and me and mf.isdisjoint(me):
         return False, f"Material/solução divergente: memorial indica {', '.join(sorted(mf))}; R96 prevê {', '.join(sorted(me))}."
-    if item_canon == "parede":
-        cg = conflito_geometria_revestimento(found, expected)
-        if cg: return False, cg
-    # Se os requisitos essenciais previstos estão presentes, detalhes adicionais são aceitos.
     if mf and me and (mf & me):
         return True, "Requisito técnico essencial compatível; diferenças de redação/complementos não alteram a conformidade."
+    # Condicionais: se o trecho encontrado satisfaz uma alternativa explícita do esperado, considera compatível
+    if any(x in normalizar(expected_cmp) for x in ["quando aplicavel", "quando houver", "se for coberto", "ou,"]):
+        sf,se=_sistemas_superficie(found),_sistemas_superficie(expected_cmp)
+        if sf and se and sf & se:
+            return True, "O memorial atende a uma das condições/alternativas previstas no R96."
     return None, ""
-
 
 def avaliar(found, expected, item_canon):
     nf, ne = normalizar(found), normalizar(expected)
@@ -797,6 +867,16 @@ def padrao_para_registro(registro, padrao_predominante, excecoes):
             melhor = (score, ex.get("padrao", padrao_predominante))
     return melhor[1] if melhor[0] >= 1.0 else padrao_predominante
 
+def nome_item_exibicao(registro, regra=None):
+    can = registro.get("item_canon", "")
+    mapa = {
+        "guarda_corpo": "GUARDA-CORPO", "porta": "PORTAS", "janela": "JANELAS",
+        "esquadria_especial": "ESQUADRIAS ESPECIAIS", "tanque": "TANQUE",
+        "bancada": "BANCADA", "louca": "LOUÇAS", "parede": "PAREDE/ SANCAS",
+        "teto": "TETO", "piso": "PISO", "metais": "METAIS"
+    }
+    return mapa.get(can, str(regra.get("item")) if regra is not None else registro.get("rotulo", can))
+
 def auditar_registros(registros, base, padrao, grupo="Regra geral", excecoes=None):
     out = []
     vistos = set()
@@ -825,7 +905,7 @@ def auditar_registros(registros, base, padrao, grupo="Regra geral", excecoes=Non
         orient = "Nenhuma ação necessária." if stt == STATUS_OK else (regra["especificacao"] if stt == STATUS_ERRO else "Comparação inconclusiva; revisar apenas se necessário.")
         out.append({
             "Grupo / Aplicação": grupo, "Padrão aplicado": padrao_item, "Área": esc,
-            "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": regra["item"],
+            "Ambiente": regra["ambiente"], "Seção": regra["secao"], "Item": nome_item_exibicao(r, regra),
             "Texto encontrado": r["valor"], "Especificação prevista": regra["especificacao"],
             "Status": stt, "Orientação / resposta prevista": orient, "Observação": obs,
             "Confiança": round(min(r["score_ambiente"], max(conf, 0.01)), 2), "Fonte": regra["fonte"],
@@ -995,7 +1075,7 @@ def configurar_excecoes_sidebar():
 def main():
     st.set_page_config(page_title="MIA | Memoriais", page_icon="M", layout="wide")
     st.title("MIA")
-    st.caption("Coordenação e Qualidade de Projetos | Memoriais")
+    st.caption(f"Coordenação e Qualidade de Projetos | Memoriais · Motor {BUILD_VERSION}")
 
     with st.sidebar:
         st.header("Configuração da análise")
@@ -1055,7 +1135,7 @@ def main():
     nerr=int((df["Status"]==STATUS_ERRO).sum()); natt=int((df["Status"]==STATUS_ATENCAO).sum()); ninfo=int((df["Status"]==STATUS_INFO).sum()); nok=int((df["Status"]==STATUS_OK).sum())
     c1,c2,c3,c4=st.columns(4)
     c1.metric("Divergências",nerr); c2.metric("Atenções",natt); c3.metric("Não verificados",ninfo); c4.metric("Conformes",nok)
-    st.caption(f"V8: {len(df)} itens localizados no próprio memorial. A análise preserva Área > Ambiente > Item > Subitem e compara requisitos técnicos, não redações idênticas.")
+    st.caption(f"{BUILD_VERSION}: {len(df)} itens localizados no próprio memorial. A análise preserva Área > Ambiente > Item > Subitem e compara requisitos técnicos, não redações idênticas.")
 
     modo=st.radio("Exibir",["Itens que exigem ação","Não verificados","Conformes","Todos"],horizontal=True)
     if modo=="Itens que exigem ação": vis=df[df["Status"].isin([STATUS_ERRO,STATUS_ATENCAO])]
